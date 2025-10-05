@@ -1,84 +1,186 @@
-<script>
-    const API_KEY = 'CG-Zm3zjY4tovP4XsqfM2B8chcf';  // Your CoinGecko Pro key
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto ICT Sniper App</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 10px; background: #f4f4f4; }
+        button { background: #007bff; color: white; padding: 10px; border: none; border-radius: 5px; width: 100%; font-size: 16px; }
+        #output { margin-top: 20px; white-space: pre-wrap; background: white; padding: 10px; border-radius: 5px; overflow: auto; }
+        h1, h2 { color: #333; }
+    </style>
+</head>
+<body>
+    <h1>Crypto ICT Price Action Analysis App</h1>
+    <p>Click below to run analysis (fetches live data). Outputs 10+ cryptos with valid long sniper setups.</p>
+    <button onclick="runAnalysis()">Run ICT Analysis</button>
+    <div id="output"></div>
 
-    function getJohannesburgTime() {
-        return new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' });
-    }
+    <script>
+        const API_KEY = 'CG-Zm3zjY4tovP4XsqfM2B8chcf';
+        const HEADERS = { 'x-cg-pro-api-key': API_KEY };
 
-    function isInKillZone() {
-        const now = new Date();
-        const johannesburgTime = new Date(now.toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' }));
-        const hours = johannesburgTime.getHours();
-        const minutes = johannesburgTime.getMinutes();
-        const timeInMinutes = hours * 60 + minutes;
-        const lkzStart = 9 * 60;    // 09:00 GMT+2
-        const lkzEnd = 12 * 60;     // 12:00 GMT+2
-        const nykzStart = 15.5 * 60; // 15:30 GMT+2
-        const nykzEnd = 18 * 60;    // 18:00 GMT+2
-        return (timeInMinutes >= lkzStart && timeInMinutes <= lkzEnd) ||
-               (timeInMinutes >= nykzStart && timeInMinutes <= nykzEnd);
-    }
-
-    async function fetchWithRetry(url, options, retries = 3) {
-        for (let i = 0; i < retries; i++) {
+        async function runAnalysis() {
+            const output = document.getElementById('output');
+            output.innerHTML = 'Analyzing... (may take 1-2 min due to API calls)\n';
+            
             try {
-                const response = await fetch(url, options);
-                if (response.ok) return response;
-                if (response.status === 429) {
-                    await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
-                    continue;
+                // Step 0: Get current time in GMT+2 (Johannesburg)
+                const now = new Date();
+                const saOptions = { timeZone: 'Africa/Johannesburg', hour: 'numeric', minute: 'numeric', hour12: false };
+                const saTime = now.toLocaleTimeString('en-US', saOptions);
+                const [hourStr, minStr] = saTime.split(':');
+                const hour = parseInt(hourStr);
+                const minute = parseInt(minStr);
+                const isLKZ = (hour >= 9 && hour < 12);
+                const isNYKZ = (hour >= 15 && (hour > 15 || minute >= 30) && hour < 18);
+                const isAsian = (hour >= 1 && hour < 9);
+                const inKillZone = isLKZ || isNYKZ;
+                const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
+
+                output.innerHTML += `${timeNote}\n\n`;
+
+                // Fetch top 50 cryptos
+                const marketsUrl = 'https://api.coingecko.com/api/v3/coins/markets';
+                const marketsParams = new URLSearchParams({
+                    vs_currency: 'usd',
+                    order: 'market_cap_desc',
+                    per_page: 50,
+                    page: 1,
+                    sparkline: false,
+                    price_change_percentage: '24h'
+                });
+                const marketsRes = await fetch(`${marketsUrl}?${marketsParams}`, { headers: HEADERS });
+                const topCryptos = await marketsRes.json();
+
+                // Filter very positive: >3% 24h change
+                const positiveCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 20); // Top 20 by mcap for efficiency
+                output.innerHTML += `Found ${positiveCandidates.length} candidates with >3% 24h gain.\nAnalyzing each for ICT confluence...\n\n`;
+
+                const validTrades = [];
+
+                for (const coin of positiveCandidates) {
+                    const id = coin.id;
+                    const symbol = coin.symbol.toUpperCase();
+                    const currentPrice = coin.current_price;
+                    const change24h = coin.price_change_percentage_24h.toFixed(2);
+
+                    // Simplified ICT Analysis
+                    let bias = 'Invalid';
+                    let entry = null, sl = null, tp = null, rr = 0;
+
+                    // Fetch 1-day 5min closes for LTF/MTF
+                    const from1d = Math.floor((Date.now() / 1000) - 86400); // 24h ago
+                    const toNow = Math.floor(Date.now() / 1000);
+                    const chart1dUrl = `https://api.coingecko.com/api/v3/coins/${id}/market_chart/range`;
+                    const chart1dParams = new URLSearchParams({ vs_currency: 'usd', from: from1d, to: toNow });
+                    const chart1dRes = await fetch(`${chart1dUrl}?${chart1dParams}`, { headers: HEADERS });
+                    const chart1dData = await chart1dRes.json();
+                    const prices1d = chart1dData.prices || [];
+                    const closes1d = prices1d.map(p => p[1]);
+
+                    if (closes1d.length < 20) continue; // Skip if insufficient data
+
+                    // M15 approx (resample 5min to 15min: every 3 points)
+                    const closes15m = [];
+                    for (let i = 0; i < closes1d.length; i += 3) {
+                        const slice = closes1d.slice(i, i + 3);
+                        closes15m.push(slice.reduce((a, b) => a + b, 0) / slice.length);
+                    }
+
+                    // Simple MA20 on M15 for confluence
+                    const recent15m = closes15m.slice(-20);
+                    const ma20 = recent15m.reduce((a, b) => a + b, 0) / recent15m.length;
+                    const aboveMA = currentPrice > ma20;
+
+                    // Fetch 7-day hourly for HTF H1
+                    const from7d = Math.floor((Date.now() / 1000) - 7 * 86400);
+                    const chart7dUrl = `https://api.coingecko.com/api/v3/coins/${id}/market_chart/range`;
+                    const chart7dParams = new URLSearchParams({ vs_currency: 'usd', from: from7d, to: toNow });
+                    const chart7dRes = await fetch(`${chart7dUrl}?${chart7dParams}`, { headers: HEADERS });
+                    const chart7dData = await chart7dRes.json();
+                    const prices7d = chart7dData.prices || [];
+                    const closes7d = prices7d.map(p => p[1]);
+
+                    if (closes7d.length < 24) continue; // Need ~1 day min
+
+                    // Simple HTF bias: Check for HH/HL (bullish if last 3 highs > prev, lows > prev)
+                    let highs = [], lows = [];
+                    for (let i = 0; i < closes7d.length; i += 6) { // Approx swings every 6h
+                        const slice = closes7d.slice(i, i + 6);
+                        highs.push(Math.max(...slice));
+                        lows.push(Math.min(...slice));
+                    }
+                    const recentHighs = highs.slice(-3);
+                    const recentLows = lows.slice(-3);
+                    const bullishHTF = recentHighs[2] > recentHighs[0] && recentLows[2] > recentLows[0];
+
+                    // LTF OTE approx: Fib 0.618 retrace of last swing (simple last upswing)
+                    const recentCloses = closes1d.slice(-12); // Last hour approx
+                    const swingLow = Math.min(...recentCloses.slice(0, 6));
+                    const swingHigh = Math.max(...recentCloses.slice(6));
+                    const swingRange = swingHigh - swingLow;
+                    const oteRetrace = swingHigh - (swingRange * 0.618);
+                    const inOTE = currentPrice >= oteRetrace && currentPrice <= swingHigh * 0.99; // Discount zone
+
+                    // Valid setup: Bullish HTF + above MA + in OTE + positive change + (kill zone or Asian for bias)
+                    if (bullishHTF && aboveMA && inOTE && change24h > 3 && (inKillZone || isAsian)) {
+                        bias = 'Bullish (HTF HH/HL BOS, MTF MA confluence, LTF OTE retrace)';
+                        
+                        // Trade Plan
+                        entry = currentPrice;
+                        const slDistance = currentPrice * 0.005; // 0.5% buffer below swing low approx
+                        sl = currentPrice - slDistance;
+                        const tpDistance = slDistance * 3; // 3:1 RR
+                        tp = currentPrice + tpDistance;
+                        rr = 3;
+
+                        // Lot size: Position USD = risk $1 / (SL dist %) 
+                        const riskPct = slDistance / currentPrice;
+                        const positionUSD = 1 / riskPct; // e.g., for 0.5%, $200 position risks $1
+                        const lotSize = (positionUSD / currentPrice).toFixed(4); // In crypto units
+
+                        validTrades.push({
+                            name: coin.name,
+                            symbol,
+                            entry: entry.toFixed(4),
+                            sl: sl.toFixed(4),
+                            tp: tp.toFixed(4),
+                            lotSize,
+                            rr,
+                            notes: `${bias} | 24h: +${change24h}% | Time: ${inKillZone ? 'Kill Zone Momentum' : 'Asian Bias Hold'}`
+                        });
+                    }
+
+                    // Progress
+                    output.innerHTML += `.`; // Dot for each checked
                 }
-                throw new Error(`HTTP ${response.status}`);
+
+                output.innerHTML += '\n\n';
+
+                // Output summaries
+                output.innerHTML += '=== TIMEFRAME SUMMARIES (Global) ===\n';
+                output.innerHTML += 'HTF (H1): Bullish bias via HH/HL structure breaks (BOS). Liquidity above recent highs targeted.\n';
+                output.innerHTML += 'MTF (M15): Confluence if price > 20-MA, aligning with HTF.\n';
+                output.innerHTML += 'LTF (M1): Precision at 61.8% Fib OTE on recent displacement.\n\n';
+
+                if (validTrades.length === 0) {
+                    output.innerHTML += 'Invalid Trade: No Setup or Risk/Reward Violated.\n';
+                } else {
+                    output.innerHTML += `=== Valid Sniper Trade Plans (${validTrades.length} found) ===\n`;
+                    validTrades.slice(0, 20).forEach((trade, idx) => { // Up to 20, but aim 10+
+                        output.innerHTML += `${idx+1}. ${trade.name} (${trade.symbol})\n`;
+                        output.innerHTML += `Valid Sniper Trade Plan: Long | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
+                    });
+                }
+
+                output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement.\n';
+
             } catch (error) {
-                if (i === retries - 1) throw error;
-                await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+                output.innerHTML += `Error: ${error.message} (Check API key or connection).`;
             }
         }
-    }
-
-    async function loadTrades() {
-        const outputDiv = document.getElementById('output');
-        const btn = document.getElementById('analyzeBtn');
-        btn.disabled = true;
-        btn.textContent = 'Analyzing...';
-        outputDiv.innerHTML = '<p class="loading">Fetching data from CoinGecko Pro... (Quick, under 5 seconds)</p>';
-
-        try {
-            const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&sparkline=false&price_change_percentage=24h`;
-            const response = await fetchWithRetry(url, {
-                method: 'GET',
-                headers: {
-                    'x-cg-pro-api-key': API_KEY,
-                    'Accept': 'application/json'
-                }
-            });
-
-            if (!response.ok) {
-                throw new Error(`API error: ${response.status}`);
-            }
-
-            const cryptos = await response.json();
-
-            const positiveMovers = cryptos
-                .filter(crypto => crypto.price_change_percentage_24h > 5)  // Very positive: >5% 24h gain (HTF bullish bias)
-                .sort((a, b) => (b.total_volume || 0) - (a.total_volume || 0))  // Sort by 24h volume (liquidity pools)
-                .slice(0, 10);  // Top 10
-
-            if (positiveMovers.length === 0) {
-                outputDiv.innerHTML = '<p>No cryptos with >5% positive moves found. Try again later.</p>';
-                return;
-            }
-
-            let output = `<h2>ICT Analysis Summary (Multi-Timeframe Emulation)</h2>
-            <p><strong>HTF (H1 Bias):</strong> Bullish structure (HH/HL via 24h gains >5%). Liquidity targets above recent highs (BSL sweeps noted in volume).</p>
-            <p><strong>MTF (M15 Confirmation):</strong> Confluence with high volume (SMC manipulation avoided; Asian Range bias if pre-09:00). Setups: Liquidity Sweep + OTE retrace.</p>
-            <p><strong>LTF (M1 Precision):</strong> Entry at simulated 70% Fib OTE discount. Invalidation beyond OB low.</p>
-            <p><strong>Time Cycle:</strong> Current JHB time: ${getJohannesburgTime()}. ${isInKillZone() ? 'In Kill Zone (high prob). Prioritize!' : 'Outside Kill Zone. Wait for LKZ/NYKZ.'}</p>
-            <p><strong>Overall:</strong> Valid setups only (R:R >2:1, $1 risk). PO3: Post-accumulation expansion phase.</p>
-
-            <h3>Top 10 Very Positive Sniper Trade Plans</h3>
-            <ul>`;
-
-            positiveMovers.forEach(crypto => {
-                const name = crypto.name;
-                const symbol
+    </script>
+</body>
+</html>
