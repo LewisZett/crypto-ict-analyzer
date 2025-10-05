@@ -1,4 +1,6 @@
 <script>
+    const API_KEY = 'CG-Zm3zjY4tovP4XsqfM2B8chcf';  // Your CoinGecko Pro key
+
     function getJohannesburgTime() {
         return new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' });
     }
@@ -17,13 +19,39 @@
                (timeInMinutes >= nykzStart && timeInMinutes <= nykzEnd);
     }
 
+    async function fetchWithRetry(url, options, retries = 3) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                const response = await fetch(url, options);
+                if (response.ok) return response;
+                if (response.status === 429) {
+                    await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
+                    continue;
+                }
+                throw new Error(`HTTP ${response.status}`);
+            } catch (error) {
+                if (i === retries - 1) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+            }
+        }
+    }
+
     async function loadTrades() {
         const outputDiv = document.getElementById('output');
-        outputDiv.innerHTML = '<p class="loading">Fetching data from CoinGecko... (Quick, under 5 seconds)</p>';
+        const btn = document.getElementById('analyzeBtn');
+        btn.disabled = true;
+        btn.textContent = 'Analyzing...';
+        outputDiv.innerHTML = '<p class="loading">Fetching data from CoinGecko Pro... (Quick, under 5 seconds)</p>';
 
         try {
             const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&sparkline=false&price_change_percentage=24h`;
-            const response = await fetch(url);
+            const response = await fetchWithRetry(url, {
+                method: 'GET',
+                headers: {
+                    'x-cg-pro-api-key': API_KEY,
+                    'Accept': 'application/json'
+                }
+            });
 
             if (!response.ok) {
                 throw new Error(`API error: ${response.status}`);
@@ -33,7 +61,7 @@
 
             const positiveMovers = cryptos
                 .filter(crypto => crypto.price_change_percentage_24h > 5)  // Very positive: >5% 24h gain (HTF bullish bias)
-                .sort((a, b) => b.total_volume - a.total_volume)  // Sort by 24h volume (liquidity pools)
+                .sort((a, b) => (b.total_volume || 0) - (a.total_volume || 0))  // Sort by 24h volume (liquidity pools)
                 .slice(0, 10);  // Top 10
 
             if (positiveMovers.length === 0) {
@@ -53,33 +81,4 @@
 
             positiveMovers.forEach(crypto => {
                 const name = crypto.name;
-                const symbol = crypto.symbol.toUpperCase();
-                const price = crypto.current_price;
-                const change24h = crypto.price_change_percentage_24h;
-
-                // Simulated ICT plan: Bullish, OTE entry at 1% discount (61.8-78.6% retrace approx), SL beyond OB (1% buffer), TP at liquidity expansion (4%)
-                const entry = price * 0.99;  // Discount entry
-                const sl = entry * 0.99;     // Below invalidation/OB
-                const tp = price * 1.04;     // Next liquidity/expansion
-                const d = entry - sl;        // Risk distance
-                const lotSize = 1 / d;       // Coins for $1 risk
-                const reward = lotSize * (tp - entry);
-                const rr = reward / 1;       // R:R ratio
-
-                // Only include if RR >2 (always true here)
-                const killZoneNote = isInKillZone() ? 'Execute in current KZ.' : 'Monitor for KZ alignment.';
-                output += `
-                    <li>
-                        <strong>${name} (${symbol}) - 24h: +${change24h.toFixed(2)}%</strong><br>
-                        <strong>Valid Sniper Trade Plan: Long</strong> | Entry: $${entry.toFixed(6)} | SL: $${sl.toFixed(6)} | TP: $${tp.toFixed(6)} | Lot Size: ${lotSize.toFixed(6)} ${symbol} | RR: ${rr.toFixed(1)}:1 | 
-                        Notes: Bullish BOS on HTF, FVG/OB confluence. ${killZoneNote} Trail SL on LTF BOS. High win prob (multi-TF alignment). Avoid if CHoCH signals reversal.
-                    </li>`;
-            });
-
-            output += '</ul><p><em>Pitfalls: Don\'t overtrade outside KZ; study ICT PO3 & OTE for refinement. Data live as of load time (CoinGecko free API).</em></p>';
-            outputDiv.innerHTML = output;
-        } catch (error) {
-            outputDiv.innerHTML = `<p>Error: ${error.message}. Check network (CoinGecko is public—no quota issues).</p>`;
-        }
-    }
-                                   </script>
+                const symbol
