@@ -11,11 +11,14 @@
         h1, h2 { color: #333; }
         .error { color: red; }
         .success { color: green; }
+        input { width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #ccc; border-radius: 5px; }
     </style>
 </head>
 <body>
     <h1>Crypto ICT Price Action Analysis App</h1>
-    <p>Now using free public CoinGecko API (no key needed). Click to run—outputs 10+ cryptos with valid long sniper setups.</p>
+    <p>Now integrated with Google Gemini AI for advanced ICT analysis (requires free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>).</p>
+    <label for="geminiKey">Gemini API Key:</label>
+    <input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
     <button onclick="runAnalysis()">Run ICT Analysis</button>
     <div id="output"></div>
 
@@ -25,9 +28,53 @@
         const BASE_URL = 'https://api.coingecko.com/api/v3'; // Public endpoint
         const HEADERS = {}; // No auth headers
 
+        let GEMINI_API_KEY = '';
+
+        async function callGemini(prompt) {
+            if (!GEMINI_API_KEY) {
+                throw new Error('Gemini API key not provided');
+            }
+            const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+            const body = {
+                contents: [{
+                    parts: [{ text: prompt }]
+                }]
+            };
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': GEMINI_API_KEY
+                },
+                body: JSON.stringify(body)
+            });
+            if (!res.ok) {
+                const errorText = await res.text();
+                throw new Error(`Gemini API error (${res.status}): ${errorText}`);
+            }
+            const data = await res.json();
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) {
+                throw new Error('No response from Gemini');
+            }
+            // Extract JSON from response (handle markdown if present)
+            const jsonMatch = text.match(/```json\s*(\{.*?\})\s*```/s) || [null, text.trim()];
+            try {
+                return JSON.parse(jsonMatch[1]);
+            } catch (e) {
+                throw new Error(`Failed to parse JSON from Gemini: ${e.message}`);
+            }
+        }
+
         async function runAnalysis() {
+            GEMINI_API_KEY = document.getElementById('geminiKey').value.trim();
             const output = document.getElementById('output');
             output.innerHTML = 'Analyzing... (may take 1-2 min due to API calls)\n';
+            
+            if (!GEMINI_API_KEY) {
+                output.innerHTML += '<span class="error">Please enter your Gemini API key!</span>\n';
+                return;
+            }
             
             try {
                 // Step 0: Get current time in GMT+2 (Johannesburg)
@@ -44,7 +91,7 @@
                 const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
 
                 output.innerHTML += `${timeNote}\n`;
-                output.innerHTML += `Using free public API mode (rate limit: ~50 calls/min).\n\n`;
+                output.innerHTML += `Using Gemini AI for ICT analysis (API key set).\n\n`;
 
                 // Fetch top 50 cryptos
                 const marketsUrl = `${BASE_URL}/coins/markets`;
@@ -73,7 +120,7 @@
 
                 // Filter very positive: >3% 24h change
                 const positiveCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 15); // Reduced for rate limits
-                output.innerHTML += `<span class="success">Found ${positiveCandidates.length} candidates with >3% 24h gain.</span>\nAnalyzing each for ICT confluence...\n\n`;
+                output.innerHTML += `<span class="success">Found ${positiveCandidates.length} candidates with >3% 24h gain.</span>\nAnalyzing each with Gemini AI for ICT confluence...\n\n`;
 
                 const validTrades = [];
 
@@ -86,7 +133,6 @@
 
                     output.innerHTML += `Checking ${symbol}...`; // Progress
 
-                    // Simplified ICT Analysis
                     let bias = 'Invalid';
                     let entry = null, sl = null, tp = null, rr = 0;
 
@@ -112,18 +158,6 @@
                             continue;
                         }
 
-                        // M15 approx (resample 5min to 15min: every 3 points)
-                        const closes15m = [];
-                        for (let j = 0; j < closes1d.length; j += 3) {
-                            const slice = closes1d.slice(j, j + 3);
-                            closes15m.push(slice.reduce((a, b) => a + b, 0) / slice.length);
-                        }
-
-                        // Simple MA20 on M15 for confluence
-                        const recent15m = closes15m.slice(-20);
-                        const ma20 = recent15m.reduce((a, b) => a + b, 0) / recent15m.length;
-                        const aboveMA = currentPrice > ma20;
-
                         // Fetch 7-day hourly for HTF H1
                         const from7d = Math.floor((Date.now() / 1000) - 7 * 86400);
                         const chart7dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
@@ -144,45 +178,60 @@
                             continue;
                         }
 
-                        // Simple HTF bias: Check for HH/HL (bullish if last 3 highs > prev, lows > prev)
-                        let highs = [], lows = [];
-                        for (let j = 0; j < closes7d.length; j += 6) { // Approx swings every 6h
-                            const slice = closes7d.slice(j, j + 6);
-                            highs.push(Math.max(...slice));
-                            lows.push(Math.min(...slice));
-                        }
-                        const recentHighs = highs.slice(-3);
-                        const recentLows = lows.slice(-3);
-                        const bullishHTF = recentHighs.length >= 3 && recentHighs[2] > recentHighs[0] && recentLows[2] > recentLows[0];
+                        // Prepare data for Gemini
+                        const recent1d = closes1d.slice(-50).join(', ');
+                        const recent7d = closes7d.slice(-50).join(', ');
+                        const prompt = `You are an expert ICT (Inner Circle Trader) sniper for crypto longs. Analyze for high-probability long setup.
 
-                        // LTF OTE approx: Fib 0.618 retrace of last swing (simple last upswing)
-                        const recentCloses = closes1d.slice(-12); // Last hour approx
-                        const swingLow = Math.min(...recentCloses.slice(0, 6));
-                        const swingHigh = Math.max(...recentCloses.slice(6));
-                        const swingRange = swingHigh - swingLow;
-                        if (swingRange <= 0) {
-                            output.innerHTML += ` (Invalid swing: Skipping ${symbol})\n`;
-                            continue;
-                        }
-                        const oteRetrace = swingHigh - (swingRange * 0.618);
-                        const inOTE = currentPrice >= oteRetrace && currentPrice <= swingHigh * 0.99; // Discount zone
+Symbol: ${symbol}
+Current Price: $${currentPrice.toFixed(4)}
+24h Change: +${change24h}%
+Session: ${timeNote}
 
-                        // Valid setup: Bullish HTF + above MA + in OTE + positive change + (kill zone or Asian for bias)
-                        if (bullishHTF && aboveMA && inOTE && parseFloat(change24h) > 3 && (inKillZone || isAsian)) {
-                            bias = 'Bullish (HTF HH/HL BOS, MTF MA confluence, LTF OTE retrace)';
-                            
-                            // Trade Plan
-                            entry = currentPrice;
-                            const slDistance = currentPrice * 0.005; // 0.5% buffer below swing low approx
-                            sl = currentPrice - slDistance;
-                            const tpDistance = slDistance * 3; // 3:1 RR
-                            tp = currentPrice + tpDistance;
-                            rr = 3;
+Price Data:
+- Recent 1-day 5min closes (last 50): [${recent1d}]
+- Recent 7-day hourly closes (last 50): [${recent7d}]
+
+Rules for valid setup:
+- HTF (H1/7d): Bullish structure (higher highs & higher lows).
+- MTF (M15 approx): Price above 20-period MA.
+- LTF (M5): In 61.8% Fibonacci OTE retracement of recent upswing, during kill zone or Asian bias.
+- Overall: Positive momentum, confluence across timeframes.
+
+If valid, suggest:
+- Bias: 'Bullish (HTF HH/HL BOS, MTF MA confluence, LTF OTE retrace)'
+- Entry: Near current price
+- SL: ~0.5% below recent swing low or structure
+- TP: 3:1 RR from entry/SL
+- RR: 3
+- Notes: Include session context
+
+Else: Bias 'Invalid'
+
+Respond ONLY with valid JSON (no extra text):
+{
+  "bias": "Bullish ... or Invalid",
+  "entry": number or null,
+  "sl": number or null,
+  "tp": number or null,
+  "rr": number or 0,
+  "notes": "string"
+}`;
+
+                        const analysis = await callGemini(prompt);
+
+                        if (analysis.bias && analysis.bias !== 'Invalid' && analysis.entry && analysis.sl && analysis.tp) {
+                            bias = analysis.bias;
+                            entry = analysis.entry;
+                            sl = analysis.sl;
+                            tp = analysis.tp;
+                            rr = analysis.rr || 3;
 
                             // Lot size: Position USD = risk $1 / (SL dist %) 
-                            const riskPct = slDistance / currentPrice;
+                            const slDistance = Math.abs(entry - sl);
+                            const riskPct = slDistance / entry;
                             const positionUSD = 1 / riskPct;
-                            const lotSize = (positionUSD / currentPrice).toFixed(4); // In crypto units
+                            const lotSize = (positionUSD / entry).toFixed(4); // In crypto units
 
                             validTrades.push({
                                 name: coin.name,
@@ -192,7 +241,7 @@
                                 tp: tp.toFixed(4),
                                 lotSize,
                                 rr,
-                                notes: `${bias} | 24h: +${change24h}% | Time: ${inKillZone ? 'Kill Zone Momentum' : 'Asian Bias Hold'}`
+                                notes: `${analysis.notes} | 24h: +${change24h}% | AI-Powered ICT Analysis`
                             });
                         }
                     } catch (coinError) {
@@ -215,20 +264,20 @@
                 output.innerHTML += 'LTF (M1): Precision at 61.8% Fib OTE on recent displacement.\n\n';
 
                 if (validTrades.length === 0) {
-                    output.innerHTML += '<span class="error">Invalid Trade: No Setup or Risk/Reward Violated.</span>\n';
-                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% in code (line ~110).\n';
+                    output.innerHTML += '<span class="error">No Valid Trade: No Setup or Risk/Reward Violated.</span>\n';
+                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% in code (line ~110). Check Gemini prompt for refinements.\n';
                 } else {
-                    output.innerHTML += `<span class="success">=== Valid Sniper Trade Plans (${validTrades.length} found) ===</span>\n`;
+                    output.innerHTML += `<span class="success">=== Valid Sniper Trade Plans (${validTrades.length} found via Gemini AI) ===</span>\n`;
                     validTrades.slice(0, 20).forEach((trade, idx) => { // Up to 20, but aim 10+
                         output.innerHTML += `${idx+1}. ${trade.name} (${trade.symbol})\n`;
                         output.innerHTML += `Valid Sniper Trade Plan: Long | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
                     });
                 }
 
-                output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement.\n';
+                output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement. Gemini analysis is AI-assisted—verify manually.\n';
 
             } catch (error) {
-                output.innerHTML += `<span class="error">Global Error: ${error.message} (Check connection).</span>\n`;
+                output.innerHTML += `<span class="error">Global Error: ${error.message} (Check connection or API key).</span>\n`;
             }
         }
     </script>
