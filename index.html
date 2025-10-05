@@ -12,6 +12,8 @@
         .error { color: red; }
         .success { color: green; }
         input { width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #ccc; border-radius: 5px; }
+        .long { color: green; font-weight: bold; }
+        .short { color: red; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -19,7 +21,7 @@
     <p>Now integrated with Google Gemini AI for advanced ICT analysis (requires free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>).</p>
     <label for="geminiKey">Gemini API Key:</label>
     <input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
-    <button onclick="runAnalysis()">Run ICT Analysis</button>
+    <button onclick="runAnalysis()">Run ICT Analysis (Both Bullish & Bearish)</button>
     <div id="output"></div>
 
     <script>
@@ -91,7 +93,7 @@
                 const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
 
                 output.innerHTML += `${timeNote}\n`;
-                output.innerHTML += `Using Gemini AI for ICT analysis (API key set).\n\n`;
+                output.innerHTML += `Using Gemini AI for ICT analysis (API key set). Scanning both bullish (>3% 24h) and bearish (<-3% 24h) momentum.\n\n`;
 
                 // Fetch top 50 cryptos
                 const marketsUrl = `${BASE_URL}/coins/markets`;
@@ -118,20 +120,20 @@
                 }
                 const topCryptos = topCryptosRaw;
 
-                // Filter very positive: >3% 24h change
-                const positiveCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 15); // Reduced for rate limits
-                output.innerHTML += `<span class="success">Found ${positiveCandidates.length} candidates with >3% 24h gain.</span>\nAnalyzing each with Gemini AI for ICT confluence...\n\n`;
+                // Filter candidates: 10 bullish and 10 bearish to respect rate limits
+                const bullishCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 10);
+                const bearishCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h < -3).slice(0, 10);
+                
+                output.innerHTML += `<span class="success">Found ${bullishCandidates.length} bullish candidates (>3% 24h) and ${bearishCandidates.length} bearish candidates (<-3% 24h).</span>\nAnalyzing each with Gemini AI for ICT confluence...\n\n`;
 
-                const validTrades = [];
+                const validTrades = { longs: [], shorts: [] };
 
-                for (let i = 0; i < positiveCandidates.length; i++) {
-                    const coin = positiveCandidates[i];
+                // Helper function to analyze a candidate
+                async function analyzeCandidate(coin, direction) {
                     const id = coin.id;
                     const symbol = coin.symbol.toUpperCase();
                     const currentPrice = coin.current_price;
                     const change24h = coin.price_change_percentage_24h.toFixed(2);
-
-                    output.innerHTML += `Checking ${symbol}...`; // Progress
 
                     let bias = 'Invalid';
                     let entry = null, sl = null, tp = null, rr = 0;
@@ -145,8 +147,7 @@
                         const chart1dRes = await fetch(`${chart1dUrl}?${chart1dParams}`, { headers: HEADERS });
                         
                         if (!chart1dRes.ok) {
-                            output.innerHTML += ` (Chart fetch failed: ${chart1dRes.status} - Skipping ${symbol})\n`;
-                            continue;
+                            return { success: false, msg: ` (Chart fetch failed: ${chart1dRes.status} - Skipping ${symbol})` };
                         }
                         
                         const chart1dData = await chart1dRes.json();
@@ -154,8 +155,7 @@
                         const closes1d = prices1d.map(p => p[1]);
 
                         if (closes1d.length < 20) {
-                            output.innerHTML += ` (Low data: Skipping ${symbol})\n`;
-                            continue;
+                            return { success: false, msg: ` (Low data: Skipping ${symbol})` };
                         }
 
                         // Fetch 7-day hourly for HTF H1
@@ -165,8 +165,7 @@
                         const chart7dRes = await fetch(`${chart7dUrl}?${chart7dParams}`, { headers: HEADERS });
                         
                         if (!chart7dRes.ok) {
-                            output.innerHTML += ` (7D chart failed: Skipping ${symbol})\n`;
-                            continue;
+                            return { success: false, msg: ` (7D chart failed: Skipping ${symbol})` };
                         }
                         
                         const chart7dData = await chart7dRes.json();
@@ -174,14 +173,16 @@
                         const closes7d = prices7d.map(p => p[1]);
 
                         if (closes7d.length < 24) {
-                            output.innerHTML += ` (Low 7D data: Skipping ${symbol})\n`;
-                            continue;
+                            return { success: false, msg: ` (Low 7D data: Skipping ${symbol})` };
                         }
 
                         // Prepare data for Gemini
                         const recent1d = closes1d.slice(-50).join(', ');
                         const recent7d = closes7d.slice(-50).join(', ');
-                        const prompt = `You are an expert ICT (Inner Circle Trader) sniper for crypto longs. Analyze for high-probability long setup.
+                        
+                        let prompt = '';
+                        if (direction === 'bullish') {
+                            prompt = `You are an expert ICT (Inner Circle Trader) sniper for crypto longs. Analyze for high-probability long setup.
 
 Symbol: ${symbol}
 Current Price: $${currentPrice.toFixed(4)}
@@ -217,6 +218,44 @@ Respond ONLY with valid JSON (no extra text):
   "rr": number or 0,
   "notes": "string"
 }`;
+                        } else { // bearish
+                            prompt = `You are an expert ICT sniper for crypto shorts. Analyze for high-probability short setup.
+
+Symbol: ${symbol}
+Current Price: $${currentPrice.toFixed(4)}
+24h Change: ${change24h}% (negative momentum)
+Session: ${timeNote}
+
+Price Data:
+- Recent 1-day 5min closes (last 50): [${recent1d}]
+- Recent 7-day hourly closes (last 50): [${recent7d}]
+
+Rules for valid setup:
+- HTF (H1/7d): Bearish structure (lower highs & lower lows).
+- MTF (M15 approx): Price below 20-period MA.
+- LTF (M5): In 61.8% Fibonacci OTE retracement of recent downswing, during kill zone or Asian bias.
+- Overall: Negative momentum, confluence across timeframes.
+
+If valid, suggest:
+- Bias: 'Bearish (HTF LH/LL BOS, MTF MA confluence, LTF OTE retrace)'
+- Entry: Near current price
+- SL: ~0.5% above recent swing high or structure
+- TP: 3:1 RR from entry/SL (downward)
+- RR: 3
+- Notes: Include session context
+
+Else: Bias 'Invalid'
+
+Respond ONLY with valid JSON (no extra text):
+{
+  "bias": "Bearish ... or Invalid",
+  "entry": number or null,
+  "sl": number or null,
+  "tp": number or null,
+  "rr": number or 0,
+  "notes": "string"
+}`;
+                        }
 
                         const analysis = await callGemini(prompt);
 
@@ -233,23 +272,59 @@ Respond ONLY with valid JSON (no extra text):
                             const positionUSD = 1 / riskPct;
                             const lotSize = (positionUSD / entry).toFixed(4); // In crypto units
 
-                            validTrades.push({
-                                name: coin.name,
-                                symbol,
-                                entry: entry.toFixed(4),
-                                sl: sl.toFixed(4),
-                                tp: tp.toFixed(4),
-                                lotSize,
-                                rr,
-                                notes: `${analysis.notes} | 24h: +${change24h}% | AI-Powered ICT Analysis`
-                            });
+                            return {
+                                success: true,
+                                trade: {
+                                    name: coin.name,
+                                    symbol,
+                                    entry: entry.toFixed(4),
+                                    sl: sl.toFixed(4),
+                                    tp: tp.toFixed(4),
+                                    lotSize,
+                                    rr,
+                                    notes: `${analysis.notes} | 24h: ${change24h}% | AI-Powered ICT Analysis`,
+                                    direction: direction === 'bullish' ? 'Long' : 'Short'
+                                }
+                            };
                         }
                     } catch (coinError) {
-                        output.innerHTML += ` (Coin error for ${symbol}: ${coinError.message} - Skipping)\n`;
-                        continue;
+                        return { success: false, msg: ` (Coin error for ${symbol}: ${coinError.message} - Skipping)` };
                     }
 
-                    output.innerHTML += ` done.\n`;
+                    return { success: false, msg: ' done.\n' };
+                }
+
+                // Analyze bullish candidates
+                output.innerHTML += '--- Bullish Analysis ---\n';
+                for (let i = 0; i < bullishCandidates.length; i++) {
+                    const coin = bullishCandidates[i];
+                    const symbol = coin.symbol.toUpperCase();
+                    output.innerHTML += `Checking ${symbol} (bullish)...`;
+                    
+                    const result = await analyzeCandidate(coin, 'bullish');
+                    output.innerHTML += result.msg || '';
+                    
+                    if (result.success) {
+                        validTrades.longs.push(result.trade);
+                    }
+                    
+                    // Tiny delay to respect rate limits
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+
+                // Analyze bearish candidates
+                output.innerHTML += '\n--- Bearish Analysis ---\n';
+                for (let i = 0; i < bearishCandidates.length; i++) {
+                    const coin = bearishCandidates[i];
+                    const symbol = coin.symbol.toUpperCase();
+                    output.innerHTML += `Checking ${symbol} (bearish)...`;
+                    
+                    const result = await analyzeCandidate(coin, 'bearish');
+                    output.innerHTML += result.msg || '';
+                    
+                    if (result.success) {
+                        validTrades.shorts.push(result.trade);
+                    }
                     
                     // Tiny delay to respect rate limits
                     await new Promise(resolve => setTimeout(resolve, 100));
@@ -259,19 +334,36 @@ Respond ONLY with valid JSON (no extra text):
 
                 // Output summaries
                 output.innerHTML += '=== TIMEFRAME SUMMARIES (Global) ===\n';
-                output.innerHTML += 'HTF (H1): Bullish bias via HH/HL structure breaks (BOS). Liquidity above recent highs targeted.\n';
-                output.innerHTML += 'MTF (M15): Confluence if price > 20-MA, aligning with HTF.\n';
+                output.innerHTML += 'HTF (H1): Bullish bias via HH/HL structure breaks (BOS). Bearish via LH/LL. Liquidity targeted above/below recent highs/lows.\n';
+                output.innerHTML += 'MTF (M15): Confluence if price >/< 20-MA, aligning with HTF.\n';
                 output.innerHTML += 'LTF (M1): Precision at 61.8% Fib OTE on recent displacement.\n\n';
 
-                if (validTrades.length === 0) {
-                    output.innerHTML += '<span class="error">No Valid Trade: No Setup or Risk/Reward Violated.</span>\n';
-                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% in code (line ~110). Check Gemini prompt for refinements.\n';
+                // Output longs
+                const totalLongs = validTrades.longs.length;
+                if (totalLongs === 0) {
+                    output.innerHTML += '<span class="error">No Valid Long Trades: No Bullish Setup or Risk/Reward Violated.</span>\n';
                 } else {
-                    output.innerHTML += `<span class="success">=== Valid Sniper Trade Plans (${validTrades.length} found via Gemini AI) ===</span>\n`;
-                    validTrades.slice(0, 20).forEach((trade, idx) => { // Up to 20, but aim 10+
-                        output.innerHTML += `${idx+1}. ${trade.name} (${trade.symbol})\n`;
-                        output.innerHTML += `Valid Sniper Trade Plan: Long | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
+                    output.innerHTML += `<span class="success">=== Valid Sniper Long Trade Plans (${totalLongs} found via Gemini AI) ===</span>\n`;
+                    validTrades.longs.forEach((trade, idx) => {
+                        output.innerHTML += `<span class="long">${idx+1}. ${trade.name} (${trade.symbol})</span>\n`;
+                        output.innerHTML += `Valid Sniper Trade Plan: ${trade.direction} | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
                     });
+                }
+
+                // Output shorts
+                const totalShorts = validTrades.shorts.length;
+                if (totalShorts === 0) {
+                    output.innerHTML += '<span class="error">No Valid Short Trades: No Bearish Setup or Risk/Reward Violated.</span>\n';
+                } else {
+                    output.innerHTML += `<span class="success">=== Valid Sniper Short Trade Plans (${totalShorts} found via Gemini AI) ===</span>\n`;
+                    validTrades.shorts.forEach((trade, idx) => {
+                        output.innerHTML += `<span class="short">${idx+1}. ${trade.name} (${trade.symbol})</span>\n`;
+                        output.innerHTML += `Valid Sniper Trade Plan: ${trade.direction} | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
+                    });
+                }
+
+                if (totalLongs === 0 && totalShorts === 0) {
+                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% / <-1% in code (lines ~120-121). Check Gemini prompt for refinements.\n';
                 }
 
                 output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement. Gemini analysis is AI-assisted—verify manually.\n';
@@ -282,4 +374,4 @@ Respond ONLY with valid JSON (no extra text):
         }
     </script>
 </body>
-</html>                    
+    </html>
