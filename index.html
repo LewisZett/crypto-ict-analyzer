@@ -15,24 +15,19 @@
 </head>
 <body>
     <h1>Crypto ICT Price Action Analysis App</h1>
-    <p>Click below to run analysis (fetches live data). Outputs 10+ cryptos with valid long sniper setups.</p>
-    <p><strong>Tip:</strong> Ensure your Pro API key is pasted below the code (starts with CG-).</p>
+    <p>Now using free public CoinGecko API (no key needed). Click to run—outputs 10+ cryptos with valid long sniper setups.</p>
     <button onclick="runAnalysis()">Run ICT Analysis</button>
     <div id="output"></div>
 
     <script>
-        // Paste your Pro API key here
-        const API_KEY = 'CG-qavGLN5gPDsgXdJZak6uN7Yd'; // e.g., 'CG-Zm3zjY4tovP4XsqfM2B8chcf'
-        const BASE_URL = API_KEY ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
-        const HEADERS = { 'x-cg-pro-api-key': API_KEY };
+        // No API key needed for public mode
+        const API_KEY = ''; // Empty for free public API
+        const BASE_URL = 'https://api.coingecko.com/api/v3'; // Public endpoint
+        const HEADERS = {}; // No auth headers
 
         async function runAnalysis() {
             const output = document.getElementById('output');
             output.innerHTML = 'Analyzing... (may take 1-2 min due to API calls)\n';
-            
-            if (!API_KEY || API_KEY === 'CG-YOUR_NEW_KEY_HERE') {
-                output.innerHTML += '<span class="error">Warning: Update API_KEY with your Pro key for full access.</span>\n';
-            }
             
             try {
                 // Step 0: Get current time in GMT+2 (Johannesburg)
@@ -49,7 +44,7 @@
                 const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
 
                 output.innerHTML += `${timeNote}\n`;
-                output.innerHTML += `Using ${API_KEY ? 'Pro' : 'Free'} API mode.\n\n`;
+                output.innerHTML += `Using free public API mode (rate limit: ~50 calls/min).\n\n`;
 
                 // Fetch top 50 cryptos
                 const marketsUrl = `${BASE_URL}/coins/markets`;
@@ -66,9 +61,6 @@
                 if (!marketsRes.ok) {
                     const errorText = await marketsRes.text();
                     output.innerHTML += `<span class="error">API Error (${marketsRes.status}): ${errorText}</span>\n`;
-                    if (marketsRes.status === 401) {
-                        output.innerHTML += 'Fix: Check/renew your Pro key at coingecko.com/en/api.\n';
-                    }
                     return;
                 }
                 
@@ -80,7 +72,7 @@
                 const topCryptos = topCryptosRaw;
 
                 // Filter very positive: >3% 24h change
-                const positiveCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 20);
+                const positiveCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 15); // Reduced for rate limits
                 output.innerHTML += `<span class="success">Found ${positiveCandidates.length} candidates with >3% 24h gain.</span>\nAnalyzing each for ICT confluence...\n\n`;
 
                 const validTrades = [];
@@ -99,7 +91,7 @@
                     let entry = null, sl = null, tp = null, rr = 0;
 
                     try {
-                        // Fetch 1-day 5min closes for LTF/MTF (Pro API supports granular)
+                        // Fetch 1-day 5min closes for LTF/MTF
                         const from1d = Math.floor((Date.now() / 1000) - 86400);
                         const toNow = Math.floor(Date.now() / 1000);
                         const chart1dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
@@ -209,6 +201,9 @@
                     }
 
                     output.innerHTML += ` done.\n`;
+                    
+                    // Tiny delay to respect rate limits
+                    await new Promise(resolve => setTimeout(resolve, 100));
                 }
 
                 output.innerHTML += '\n';
@@ -221,6 +216,7 @@
 
                 if (validTrades.length === 0) {
                     output.innerHTML += '<span class="error">Invalid Trade: No Setup or Risk/Reward Violated.</span>\n';
+                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% in code (line ~110).\n';
                 } else {
                     output.innerHTML += `<span class="success">=== Valid Sniper Trade Plans (${validTrades.length} found) ===</span>\n`;
                     validTrades.slice(0, 20).forEach((trade, idx) => { // Up to 20, but aim 10+
@@ -232,7 +228,7 @@
                 output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement.\n';
 
             } catch (error) {
-                output.innerHTML += `<span class="error">Global Error: ${error.message} (Check connection or key).</span>\n`;
+                output.innerHTML += `<span class="error">Global Error: ${error.message} (Check connection).</span>\n`;
             }
         }
     </script>
