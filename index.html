@@ -16,18 +16,23 @@
 <body>
     <h1>Crypto ICT Price Action Analysis App</h1>
     <p>Click below to run analysis (fetches live data). Outputs 10+ cryptos with valid long sniper setups.</p>
-    <p><strong>Tip:</strong> Update your API key below if errors persist.</p>
+    <p><strong>Tip:</strong> Ensure your Pro API key is pasted below the code (starts with CG-).</p>
     <button onclick="runAnalysis()">Run ICT Analysis</button>
     <div id="output"></div>
 
     <script>
-        // Paste your NEW API key here (or leave empty for public mode - slower)
-        const API_KEY = 'CG-Zm3zjY4tovP4XsqfM2B8chcf'; // e.g., 'CG-abc123...'
-        const HEADERS = API_KEY ? { 'x-cg-pro-api-key': API_KEY } : {};
+        // Paste your Pro API key here
+        const API_KEY = 'CG-YOUR_NEW_KEY_HERE'; // e.g., 'CG-Zm3zjY4tovP4XsqfM2B8chcf'
+        const BASE_URL = API_KEY ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
+        const HEADERS = { 'x-cg-pro-api-key': API_KEY };
 
         async function runAnalysis() {
             const output = document.getElementById('output');
             output.innerHTML = 'Analyzing... (may take 1-2 min due to API calls)\n';
+            
+            if (!API_KEY || API_KEY === 'CG-YOUR_NEW_KEY_HERE') {
+                output.innerHTML += '<span class="error">Warning: Update API_KEY with your Pro key for full access.</span>\n';
+            }
             
             try {
                 // Step 0: Get current time in GMT+2 (Johannesburg)
@@ -43,10 +48,11 @@
                 const inKillZone = isLKZ || isNYKZ;
                 const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
 
-                output.innerHTML += `${timeNote}\n\n`;
+                output.innerHTML += `${timeNote}\n`;
+                output.innerHTML += `Using ${API_KEY ? 'Pro' : 'Free'} API mode.\n\n`;
 
                 // Fetch top 50 cryptos
-                const marketsUrl = 'https://api.coingecko.com/api/v3/coins/markets';
+                const marketsUrl = `${BASE_URL}/coins/markets`;
                 const marketsParams = new URLSearchParams({
                     vs_currency: 'usd',
                     order: 'market_cap_desc',
@@ -61,7 +67,7 @@
                     const errorText = await marketsRes.text();
                     output.innerHTML += `<span class="error">API Error (${marketsRes.status}): ${errorText}</span>\n`;
                     if (marketsRes.status === 401) {
-                        output.innerHTML += 'Fix: Get a new free key from coingecko.com/en/api and paste it in the code.\n';
+                        output.innerHTML += 'Fix: Check/renew your Pro key at coingecko.com/en/api.\n';
                     }
                     return;
                 }
@@ -93,10 +99,10 @@
                     let entry = null, sl = null, tp = null, rr = 0;
 
                     try {
-                        // Fetch 1-day 5min closes for LTF/MTF
+                        // Fetch 1-day 5min closes for LTF/MTF (Pro API supports granular)
                         const from1d = Math.floor((Date.now() / 1000) - 86400);
                         const toNow = Math.floor(Date.now() / 1000);
-                        const chart1dUrl = `https://api.coingecko.com/api/v3/coins/${id}/market_chart/range`;
+                        const chart1dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
                         const chart1dParams = new URLSearchParams({ vs_currency: 'usd', from: from1d, to: toNow });
                         const chart1dRes = await fetch(`${chart1dUrl}?${chart1dParams}`, { headers: HEADERS });
                         
@@ -128,7 +134,7 @@
 
                         // Fetch 7-day hourly for HTF H1
                         const from7d = Math.floor((Date.now() / 1000) - 7 * 86400);
-                        const chart7dUrl = `https://api.coingecko.com/api/v3/coins/${id}/market_chart/range`;
+                        const chart7dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
                         const chart7dParams = new URLSearchParams({ vs_currency: 'usd', from: from7d, to: toNow });
                         const chart7dRes = await fetch(`${chart7dUrl}?${chart7dParams}`, { headers: HEADERS });
                         
@@ -155,18 +161,22 @@
                         }
                         const recentHighs = highs.slice(-3);
                         const recentLows = lows.slice(-3);
-                        const bullishHTF = recentHighs[2] > recentHighs[0] && recentLows[2] > recentLows[0];
+                        const bullishHTF = recentHighs.length >= 3 && recentHighs[2] > recentHighs[0] && recentLows[2] > recentLows[0];
 
                         // LTF OTE approx: Fib 0.618 retrace of last swing (simple last upswing)
                         const recentCloses = closes1d.slice(-12); // Last hour approx
                         const swingLow = Math.min(...recentCloses.slice(0, 6));
                         const swingHigh = Math.max(...recentCloses.slice(6));
                         const swingRange = swingHigh - swingLow;
+                        if (swingRange <= 0) {
+                            output.innerHTML += ` (Invalid swing: Skipping ${symbol})\n`;
+                            continue;
+                        }
                         const oteRetrace = swingHigh - (swingRange * 0.618);
                         const inOTE = currentPrice >= oteRetrace && currentPrice <= swingHigh * 0.99; // Discount zone
 
                         // Valid setup: Bullish HTF + above MA + in OTE + positive change + (kill zone or Asian for bias)
-                        if (bullishHTF && aboveMA && inOTE && change24h > 3 && (inKillZone || isAsian)) {
+                        if (bullishHTF && aboveMA && inOTE && parseFloat(change24h) > 3 && (inKillZone || isAsian)) {
                             bias = 'Bullish (HTF HH/HL BOS, MTF MA confluence, LTF OTE retrace)';
                             
                             // Trade Plan
@@ -227,4 +237,4 @@
         }
     </script>
 </body>
-</html>                       
+</html>
