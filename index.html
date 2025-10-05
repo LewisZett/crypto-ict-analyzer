@@ -34,7 +34,7 @@
             if (!GEMINI_API_KEY) {
                 throw new Error('Gemini API key not provided');
             }
-            const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+            const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
             const body = {
                 contents: [{
                     parts: [{ text: prompt }]
@@ -282,4 +282,4 @@ Respond ONLY with valid JSON (no extra text):
         }
     </script>
 </body>
-</html>
+</html>                    
