@@ -100,6 +100,12 @@
             </label>
         </div>
         <div>
+            <label for="killzoneOnly" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
+                <input type="checkbox" id="killzoneOnly" style="width:auto; margin:0;">
+                Kill zone only (London/NY sessions - applies to both Backtest and Live Run)
+            </label>
+        </div>
+        <div>
             <label for="displayTimezone">Display Timezone</label>
             <select id="displayTimezone">
                 <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
@@ -152,7 +158,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'displayTimezone'];
+    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'killzoneOnly', 'displayTimezone'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -183,6 +189,7 @@
             candidateCount: Math.max(1, Math.min(25, parseInt(document.getElementById('candidateCount').value) || 10)),
             geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
             strictConfluence: document.getElementById('strictConfluence').checked,
+            killzoneOnly: document.getElementById('killzoneOnly').checked,
             displayTimezone: document.getElementById('displayTimezone').value
         };
     }
@@ -692,6 +699,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // Kill zone / session logic (computed in UTC to avoid DST/locale bugs,
     // displayed in the user's chosen timezone). Windows mirror standard
     // approximate ICT session times; treat as approximate, not authoritative.
+    // Shared by both the live-run session banner AND the backtest's
+    // optional kill-zone-only filter, so both paths use the exact same
+    // definition of "in a kill zone" instead of two logics drifting apart.
     // ------------------------------------------------------------------
     function formatTimeInTz(date, displayTz) {
         try {
@@ -702,15 +712,30 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
     }
 
+    // Core kill-zone classification for an arbitrary UTC hour/minute. Used
+    // both for "now" (live run) and for historical candle timestamps
+    // (backtest), so the exact same window definitions apply everywhere.
+    function classifyKillZone(utcHour, utcMinute) {
+        const isLKZ = utcHour >= 7 && utcHour < 10;                                   // London KZ ~07:00-10:00 UTC
+        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15; // NY KZ ~13:30-16:00 UTC
+        const isAsian = utcHour >= 23 || utcHour < 7;                                 // Asian session ~23:00-07:00 UTC
+        return { isLKZ, isNYKZ, isAsian, inKillZone: isLKZ || isNYKZ };
+    }
+
+    // Convenience wrapper for a millisecond timestamp (e.g. a candle's
+    // closeTime from Binance klines) - used by the backtest's kill-zone-only
+    // filter to classify each historical bar.
+    function isTimestampInKillZone(timestampMs) {
+        const d = new Date(timestampMs);
+        return classifyKillZone(d.getUTCHours(), d.getUTCMinutes()).inKillZone;
+    }
+
     function getSessionInfo(displayTz) {
         const now = new Date();
         const utcHour = now.getUTCHours();
         const utcMinute = now.getUTCMinutes();
 
-        const isLKZ = utcHour >= 7 && utcHour < 10;                                   // London KZ ~07:00-10:00 UTC
-        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15; // NY KZ ~13:30-16:00 UTC
-        const isAsian = utcHour >= 23 || utcHour < 7;                                 // Asian session ~23:00-07:00 UTC
-        const inKillZone = isLKZ || isNYKZ;
+        const { isLKZ, isNYKZ, isAsian, inKillZone } = classifyKillZone(utcHour, utcMinute);
 
         const displayTime = formatTimeInTz(now, displayTz);
 
@@ -916,12 +941,24 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // Walks forward through LTF candles for one direction, only searching
     // for a new signal once any open position has resolved (no overlapping
     // positions in the same direction - keeps the trade count honest).
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence) {
+    // When killzoneOnly is true, a bar is only eligible to trigger a NEW
+    // signal if its closeTime falls inside the London or NY kill zone
+    // (same window definitions as the live-run session banner) - bars
+    // outside a kill zone are skipped entirely for signal search, though
+    // an already-open position is still walked forward normally to its
+    // SL/TP/timeout regardless of what time it resolves at.
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
         while (i < ltfKlines.length) {
             const bar = ltfKlines[i];
+
+            if (killzoneOnly && !isTimestampInKillZone(bar.closeTime)) {
+                i++;
+                continue;
+            }
+
             const closesHTFasOf = getHTFSliceAsOf(htfKlines, bar.closeTime, 168);
             const candlesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1);
 
@@ -1005,10 +1042,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 return;
             }
             btLogFn(`Got ${klines1h.length} 1h candles (~${Math.round(klines1h.length / 24)} days) and ${klines5m.length} 5m candles (~${(klines5m.length * 5 / 60 / 24).toFixed(1)} days).`);
-            btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}...\n`);
+            btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
             const allStats = summarizeBacktest([...longTrades, ...shortTrades]);
@@ -1026,7 +1063,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             btLogFn('\nRemember: this is one symbol, one recent data window (limited by how much history Binance\'s free klines endpoint returns), and it excludes Gemini entirely. Small sample sizes here are NOT a reliable estimate of edge - re-run across multiple symbols and time windows before drawing conclusions.', 'error');
 
             btResults.innerHTML = `
-                <div class="row"><strong>${symbol} backtest (targetRR ${config.targetRR}:1)</strong></div>
+                <div class="row"><strong>${symbol} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''})</strong></div>
                 <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
                 <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
             `;
@@ -1778,6 +1815,26 @@ Respond ONLY with valid JSON, no extra text:
             return;
         }
 
+        const sessionInfo = getSessionInfo(config.displayTimezone);
+
+        // Kill-zone-only gate for live runs. Unlike the backtest (which can
+        // selectively skip individual historical bars), a live run only has
+        // "now" to work with - so when this setting is on and we're
+        // currently outside London/NY session windows, the whole run is
+        // paused rather than silently scanning off-session and producing
+        // signals the user asked NOT to see. This mirrors the circuit
+        // breaker's block-and-explain pattern.
+        if (config.killzoneOnly && !sessionInfo.inKillZone) {
+            log(sessionInfo.summary);
+            log('Kill zone only is ON in Settings, and the current time is outside both the London and New York kill zones - run blocked.', 'error');
+            const nextRun = suggestNextRunTime(sessionInfo, config.displayTimezone);
+            log(`Next eligible run: ${nextRun.message}`, 'error');
+            const suggestionEl = document.getElementById('nextRunSuggestion');
+            suggestionEl.style.display = 'block';
+            suggestionEl.innerHTML = `<strong>Next run suggestion:</strong> ${nextRun.message}`;
+            return;
+        }
+
         isRunning = true;
         currentController = new AbortController();
         document.getElementById('runBtn').disabled = true;
@@ -1792,8 +1849,8 @@ Respond ONLY with valid JSON, no extra text:
             }
             log('Gemini key OK.', 'success');
 
-            const sessionInfo = getSessionInfo(config.displayTimezone);
             log(sessionInfo.summary);
+            if (config.killzoneOnly) log('Kill zone only is ON - this run is proceeding because current time is inside a kill zone.', 'success');
 
             log('Fetching top 50 markets from CoinGecko...');
             const topCryptos = await fetchTopMarkets(currentController.signal);
