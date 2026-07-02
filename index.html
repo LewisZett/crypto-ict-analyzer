@@ -133,6 +133,7 @@
 </div>
 
 <div id="log"></div>
+<div id="nextRunSuggestion" class="note" style="display:none;"></div>
 <div id="cards"></div>
 <button id="copyBtn" onclick="copyTradePlan()">Copy Trade Plan</button>
 
@@ -276,6 +277,81 @@
     }
 
     // ------------------------------------------------------------------
+    // News check via Gemini's Google Search grounding tool. This is kept
+    // as a SEPARATE call from the confidence-rating call above, because
+    // enabling a search tool and demanding strict JSON-only output at the
+    // same time is unreliable - the model wants to narrate its search.
+    // Crucially, we do NOT trust Gemini's prose for source links (models
+    // can invent plausible-looking URLs). The actual source URLs come from
+    // groundingMetadata, which reflects real pages the grounding tool
+    // found - that's what gets shown to the user to verify independently.
+    // ------------------------------------------------------------------
+    async function callGeminiWithSearch(prompt, apiKey, signal) {
+        const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+        const body = {
+            contents: [{ parts: [{ text: prompt }] }],
+            tools: [{ google_search: {} }]
+        };
+        const res = await fetchWithRetry(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify(body),
+            signal
+        });
+        if (!res.ok) {
+            const errorText = await res.text();
+            throw new Error(`Gemini search error (${res.status}): ${errorText.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        const candidate = data.candidates?.[0];
+        const text = candidate?.content?.parts?.map(p => p.text).filter(Boolean).join('\n');
+        if (!text) throw new Error('No response text from Gemini (news search)');
+
+        const chunks = candidate?.groundingMetadata?.groundingChunks || [];
+        const sources = chunks
+            .map(c => ({ title: c.web?.title, uri: c.web?.uri }))
+            .filter(s => s.uri);
+
+        return { text, sources };
+    }
+
+    function buildNewsCheckPrompt(coin, direction) {
+        const dirLabel = direction === 'bullish' ? 'long' : 'short';
+        return `Search for recent news (last 48 hours) about ${coin.name} (${coin.symbol.toUpperCase()}) cryptocurrency that could be relevant to a ${dirLabel} trade.
+
+Look specifically for: regulatory action or enforcement, exchange listings/delistings, hacks or exploits, major protocol/partnership announcements, token unlocks, lawsuits, or notable founder/executive statements. Ignore routine price commentary, generic "technical analysis" articles, or anything that isn't a discrete news event.
+
+After searching, respond with ONLY this JSON object and no other text before or after it:
+{
+  "newsFound": true or false,
+  "riskLevel": "none", "low", "medium", or "high",
+  "summary": "one or two sentence summary of what you found, or 'No material news in the last 48 hours' if nothing relevant turned up",
+  "conflictsWithDirection": true or false
+}`;
+    }
+
+    function validateNewsCheck(analysis) {
+        if (typeof analysis.newsFound !== 'boolean') return 'Missing or invalid "newsFound" field';
+        if (!['none', 'low', 'medium', 'high'].includes(analysis.riskLevel)) return 'Missing or invalid "riskLevel" field';
+        if (typeof analysis.conflictsWithDirection !== 'boolean') return 'Missing or invalid "conflictsWithDirection" field';
+        return null;
+    }
+
+    async function checkCoinNews(coin, direction, apiKey, signal) {
+        const prompt = buildNewsCheckPrompt(coin, direction);
+        const { text, sources } = await callGeminiWithSearch(prompt, apiKey, signal);
+        let analysis;
+        try {
+            analysis = extractJSON(text);
+        } catch (e) {
+            throw new Error(`Failed to parse news-check JSON: ${e.message}`);
+        }
+        const validationError = validateNewsCheck(analysis);
+        if (validationError) throw new Error(`News-check response invalid: ${validationError}`);
+        return { ...analysis, sources };
+    }
+
+    // ------------------------------------------------------------------
     // Local technical indicators (Phase 2: keep math out of the LLM)
     // ------------------------------------------------------------------
     function calculateSMA(closes, period) {
@@ -399,6 +475,15 @@
     // displayed in the user's chosen timezone). Windows mirror standard
     // approximate ICT session times; treat as approximate, not authoritative.
     // ------------------------------------------------------------------
+    function formatTimeInTz(date, displayTz) {
+        try {
+            const tz = displayTz === 'local' ? Intl.DateTimeFormat().resolvedOptions().timeZone : displayTz;
+            return date.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }) + ' (' + tz + ')';
+        } catch (e) {
+            return date.toISOString().slice(11, 16) + ' UTC';
+        }
+    }
+
     function getSessionInfo(displayTz) {
         const now = new Date();
         const utcHour = now.getUTCHours();
@@ -409,18 +494,56 @@
         const isAsian = utcHour >= 23 || utcHour < 7;                                 // Asian session ~23:00-07:00 UTC
         const inKillZone = isLKZ || isNYKZ;
 
-        let displayTime;
-        try {
-            const tz = displayTz === 'local' ? Intl.DateTimeFormat().resolvedOptions().timeZone : displayTz;
-            displayTime = now.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }) + ' (' + tz + ')';
-        } catch (e) {
-            displayTime = now.toISOString().slice(11, 16) + ' UTC';
-        }
+        const displayTime = formatTimeInTz(now, displayTz);
 
         return {
             displayTime,
             isLKZ, isNYKZ, isAsian, inKillZone,
             summary: `Current time: ${displayTime} | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Next-run suggestion. ICT kill zones exist because liquidity/volatility
+    // cluster in specific windows - scanning at 3am in the middle of the
+    // Asian session isn't "wrong," but it's scanning during the lowest-
+    // confluence window by the methodology's own logic. This doesn't
+    // predict anything; it just tells you when the next window the
+    // strategy considers high-probability actually starts, and enforces a
+    // sane minimum gap so you're not just re-scanning the same 5m candle.
+    // ------------------------------------------------------------------
+    const MIN_RESCAN_MINUTES = 15; // shortest gap worth re-running at (5m LTF candle plus buffer)
+
+    function suggestNextRunTime(sessionInfo, displayTz) {
+        const now = new Date();
+
+        if (sessionInfo.inKillZone) {
+            const zoneName = sessionInfo.isLKZ ? 'London Kill Zone' : 'New York Kill Zone';
+            const suggestedTime = new Date(now.getTime() + MIN_RESCAN_MINUTES * 60 * 1000);
+            return {
+                suggestedTime,
+                message: `Still inside the ${zoneName}. Re-running now would mostly re-scan the same 5m candle - next worthwhile check is around ${formatTimeInTz(suggestedTime, displayTz)} (~${MIN_RESCAN_MINUTES}m from now).`
+            };
+        }
+
+        const utcHour = now.getUTCHours(), utcMinute = now.getUTCMinutes();
+        const nowMin = utcHour * 60 + utcMinute;
+        const zones = [
+            { name: 'London Kill Zone', startMin: 7 * 60 },
+            { name: 'New York Kill Zone', startMin: 13 * 60 + 30 }
+        ];
+        const withDiff = zones.map(z => {
+            let diff = z.startMin - nowMin;
+            if (diff <= 0) diff += 24 * 60;
+            return { ...z, diff };
+        }).sort((a, b) => a.diff - b.diff);
+        const next = withDiff[0];
+        const suggestedTime = new Date(now.getTime() + next.diff * 60 * 1000);
+        const hrs = Math.floor(next.diff / 60), mins = next.diff % 60;
+
+        return {
+            suggestedTime,
+            message: `Outside both kill zones right now (${sessionInfo.isAsian ? 'Asian session - lowest liquidity/lowest confluence by this methodology' : 'off-session'}). Next kill zone is the ${next.name}, starting ${formatTimeInTz(suggestedTime, displayTz)} - about ${hrs}h ${mins}m away. That's the next run worth prioritizing; scanning before then will mostly hit the local filter's "structure/OTE not confirmed" skip reasons.`
         };
     }
 
@@ -722,6 +845,11 @@
             rr: trade.rr,
             confidence: trade.confidence,
             notes: trade.notes,
+            units: trade.units,
+            positionUSD: trade.positionUSD,
+            riskAmount: trade.riskAmount,
+            dataAgeMinutes: trade.dataAgeMinutes,
+            newsCheck: trade.newsCheck || null,
             loggedAt: Date.now(),
             status: 'pending',
             resolvedAt: null,
@@ -762,7 +890,21 @@
         listEl.innerHTML = journal.slice().reverse().slice(0, 100).map(e => {
             const cls = e.status === 'win' ? 'success' : e.status === 'loss' ? 'error' : e.status === 'pending' ? '' : 'muted';
             const rrText = e.rrAchieved !== null ? `${e.rrAchieved > 0 ? '+' : ''}${e.rrAchieved.toFixed(2)}R` : '-';
-            return `<div class="row"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</div>`;
+            const sizingText = (e.units !== undefined && e.positionUSD !== undefined && e.riskAmount !== undefined)
+                ? `${e.units} ${e.symbol} (~$${e.positionUSD} notional, risking ~$${e.riskAmount})`
+                : 'Position sizing not recorded for this entry (logged before this field was added).';
+            const resolvedText = e.resolvedAt ? ` | Resolved: ${new Date(e.resolvedAt).toLocaleString()}` : '';
+            return `
+                <details class="row" style="background:#fafafa; border-radius:4px; padding:4px 8px; margin-bottom:4px;">
+                    <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
+                    <div class="row" style="margin-top:6px;">Entry: $${e.entry} | SL: $${e.sl} | TP: $${e.tp} | RR: ${e.rr}:1</div>
+                    <div class="row">Position: ${sizingText}</div>
+                    <div class="row">AI context read (unvalidated) at time of signal: ${e.confidence}</div>
+                    <div class="row muted">${e.notes || 'No notes recorded.'}</div>
+                    ${e.newsCheck ? renderNewsSection(e.newsCheck) : '<div class="row muted">News check: not recorded for this entry.</div>'}
+                    <div class="row muted">Logged: ${new Date(e.loggedAt).toLocaleString()}${resolvedText}</div>
+                </details>
+            `;
         }).join('');
     }
 
@@ -841,11 +983,13 @@
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,notes\n';
+        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,notes\n';
         const rows = journal.map(e => [
             e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
             e.rrAchieved !== null ? e.rrAchieved.toFixed(4) : '',
+            e.units !== undefined ? e.units : '', e.positionUSD !== undefined ? e.positionUSD : '',
+            e.riskAmount !== undefined ? e.riskAmount : '', e.dataAgeMinutes !== undefined ? e.dataAgeMinutes : '',
             `"${(e.notes || '').replace(/"/g, '""')}"`
         ].join(',')).join('\n');
         const blob = new Blob([header + rows], { type: 'text/csv' });
@@ -902,6 +1046,10 @@
                 const imported = lines.slice(1).map(line => {
                     const f = parseCSVLine(line);
                     const get = (name) => f[header.indexOf(name)];
+                    const numOrUndefined = (name) => {
+                        const v = get(name);
+                        return v !== undefined && v !== '' ? parseFloat(v) : undefined;
+                    };
                     const loggedAtStr = get('loggedAt');
                     const resolvedAtStr = get('resolvedAt');
                     const rrAchievedStr = get('rrAchieved');
@@ -915,6 +1063,10 @@
                         rr: parseFloat(get('rr')),
                         confidence: get('confidence'),
                         notes: get('notes') || '',
+                        units: numOrUndefined('units'),
+                        positionUSD: numOrUndefined('positionUSD'),
+                        riskAmount: numOrUndefined('riskAmount'),
+                        dataAgeMinutes: numOrUndefined('dataAgeMinutes'),
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
                         status: get('status') || 'pending',
                         resolvedAt: resolvedAtStr ? Date.parse(resolvedAtStr) : null,
@@ -995,6 +1147,25 @@ Respond ONLY with valid JSON, no extra text:
     // ------------------------------------------------------------------
     let lastValidTrades = { longs: [], shorts: [] };
 
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str == null ? '' : String(str);
+        return div.innerHTML;
+    }
+
+    function renderNewsSection(newsCheck) {
+        if (!newsCheck) return '<div class="row muted">News check: not run.</div>';
+        const riskColor = { high: 'error', medium: 'error', low: '', none: 'muted', unchecked: 'muted' }[newsCheck.riskLevel] || '';
+        const sourcesHtml = (newsCheck.sources && newsCheck.sources.length > 0)
+            ? `<div class="row muted">Sources: ${newsCheck.sources.map(s => `<a href="${escapeHtml(s.uri)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || s.uri)}</a>`).join(' | ')}</div>`
+            : '<div class="row muted">No sources returned - verify independently before trading.</div>';
+        return `
+            <div class="row">News check (Gemini + Google Search, verify sources yourself): <span class="${riskColor}">${newsCheck.riskLevel}</span> risk${newsCheck.conflictsWithDirection ? ' - CONFLICTS with this direction' : ''}</div>
+            <div class="row muted">${escapeHtml(newsCheck.summary)}</div>
+            ${sourcesHtml}
+        `;
+    }
+
     function renderTradeCard(trade) {
         const cards = document.getElementById('cards');
         const cls = trade.direction === 'Long' ? 'long' : 'short';
@@ -1007,6 +1178,7 @@ Respond ONLY with valid JSON, no extra text:
             <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
             <div class="row muted">${trade.notes}</div>
             <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
+            ${renderNewsSection(trade.newsCheck)}
         `;
         cards.appendChild(div);
     }
@@ -1087,6 +1259,26 @@ Respond ONLY with valid JSON, no extra text:
         if (validationError) return { success: false, reason: `Gemini response invalid: ${validationError}` };
         if (!analysis.valid) return { success: false, reason: `Gemini: ${analysis.notes || 'context did not support setup'}` };
 
+        // News check - only runs for candidates that already survived the
+        // technical filter AND Gemini's context read, to avoid burning
+        // search-grounded calls on setups that would be discarded anyway.
+        // A failed/errored news check does NOT kill the trade (news search
+        // is a bonus signal, not a hard requirement) - it's just flagged as
+        // unchecked so you know to verify manually.
+        let newsCheck = null;
+        try {
+            newsCheck = await checkCoinNews(coin, direction, apiKey, signal);
+            if (newsCheck.riskLevel === 'high' && newsCheck.conflictsWithDirection) {
+                return {
+                    success: false,
+                    reason: `News check: HIGH risk, conflicts with ${direction === 'bullish' ? 'long' : 'short'} direction - ${newsCheck.summary}`
+                };
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            newsCheck = { newsFound: false, riskLevel: 'unchecked', summary: `News check failed: ${e.message} - verify manually before trading.`, conflictsWithDirection: false, sources: [] };
+        }
+
         const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
 
         return {
@@ -1104,7 +1296,8 @@ Respond ONLY with valid JSON, no extra text:
                 confidence: analysis.confidence,
                 notes: `${analysis.notes} | 24h: ${change24h}%`,
                 direction: direction === 'bullish' ? 'Long' : 'Short',
-                dataAgeMinutes: Math.max(candles.dataQuality.htfAgeMinutes, candles.dataQuality.ltfAgeMinutes)
+                dataAgeMinutes: Math.max(candles.dataQuality.htfAgeMinutes, candles.dataQuality.ltfAgeMinutes),
+                newsCheck
             }
         };
     }
@@ -1168,7 +1361,16 @@ Respond ONLY with valid JSON, no extra text:
                 const symbol = coin.symbol.toUpperCase();
                 setProgress(i, total, `Scanning ${i + 1}/${total}: ${symbol}`);
 
-                const result = await analyzeCandidate(coin, direction, config, sessionInfo, apiKey, currentController.signal);
+                let result;
+                try {
+                    result = await analyzeCandidate(coin, direction, config, sessionInfo, apiKey, currentController.signal);
+                } catch (e) {
+                    if (e.name === 'AbortError') throw e; // real cancel - stop the run
+                    // A single coin's fetch failing (network blip, brief Binance
+                    // hiccup, etc.) should not abort the other 11 - skip and
+                    // keep going, same as any other per-coin skip reason.
+                    result = { success: false, reason: `Unexpected error - skipped: ${e.message}` };
+                }
                 setProgress(i + 1, total, `Scanned ${i + 1}/${total}: ${symbol}`);
 
                 if (result.success) {
@@ -1176,7 +1378,10 @@ Respond ONLY with valid JSON, no extra text:
                     else lastValidTrades.shorts.push(result.trade);
                     renderTradeCard(result.trade);
                     logTradeToJournal(result.trade);
-                    log(`${symbol} (${direction}): VALID setup found - logged to journal.`, 'success');
+                    const newsNote = result.trade.newsCheck
+                        ? ` | News: ${result.trade.newsCheck.riskLevel}${result.trade.newsCheck.riskLevel === 'unchecked' ? ' (check failed - verify manually)' : ''}`
+                        : '';
+                    log(`${symbol} (${direction}): VALID setup found - logged to journal.${newsNote}`, 'success');
                 } else {
                     log(`${symbol} (${direction}): skipped - ${result.reason}`);
                 }
@@ -1194,6 +1399,12 @@ Respond ONLY with valid JSON, no extra text:
                 document.getElementById('copyBtn').style.display = 'block';
             }
             log('\nReminder: verify every setup manually before acting. AI output is context, not certainty.', 'error');
+
+            const nextRun = suggestNextRunTime(sessionInfo, config.displayTimezone);
+            log(`\nNext run suggestion: ${nextRun.message}`, 'success');
+            const suggestionEl = document.getElementById('nextRunSuggestion');
+            suggestionEl.style.display = 'block';
+            suggestionEl.innerHTML = `<strong>Next run suggestion:</strong> ${nextRun.message}`;
 
         } catch (error) {
             if (error.name === 'AbortError') {
