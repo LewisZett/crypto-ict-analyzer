@@ -1023,14 +1023,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fields;
     }
 
-    // Imports a previously exported journal CSV (from this device or
-    // another one) and merges it into the local journal. Entries are
-    // deduped by id where available, falling back to a symbol+loggedAt+entry
-    // match for older exports that predate the id column. Existing local
-    // entries are NOT overwritten by an import - if both a local pending
-    // entry and an imported resolved entry share an id, the resolved one
-    // wins, since "checked outcome" is strictly more information than
-    // "still pending."
+    // ------------------------------------------------------------------
+    // PATCHED import: forces all imported entries to "pending" with null rrAchieved,
+    // so they are never trusted as wins without re-checking against live data.
+    // ------------------------------------------------------------------
     function importJournalCSV(event) {
         const file = event.target.files[0];
         if (!file) return;
@@ -1051,8 +1047,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         return v !== undefined && v !== '' ? parseFloat(v) : undefined;
                     };
                     const loggedAtStr = get('loggedAt');
-                    const resolvedAtStr = get('resolvedAt');
-                    const rrAchievedStr = get('rrAchieved');
                     return {
                         id: hasId && get('id') ? get('id') : `${get('symbol')}-${Date.parse(loggedAtStr)}-${get('entry')}`,
                         symbol: get('symbol'),
@@ -1068,9 +1062,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         riskAmount: numOrUndefined('riskAmount'),
                         dataAgeMinutes: numOrUndefined('dataAgeMinutes'),
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
-                        status: get('status') || 'pending',
-                        resolvedAt: resolvedAtStr ? Date.parse(resolvedAtStr) : null,
-                        rrAchieved: rrAchievedStr !== '' && rrAchievedStr !== undefined ? parseFloat(rrAchievedStr) : null
+                        // Force all imported entries to pending, with no resolved outcome.
+                        status: 'pending',
+                        resolvedAt: null,
+                        rrAchieved: null
                     };
                 }).filter(e => e.symbol && !isNaN(e.entry));
 
@@ -1083,17 +1078,22 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     if (!match) {
                         byId.set(imp.id, imp);
                         added++;
-                    } else if (match.status === 'pending' && imp.status !== 'pending') {
-                        // Imported copy has a resolved outcome the local copy doesn't - take it.
-                        byId.set(imp.id, imp);
-                        updated++;
+                    } else {
+                        // If the imported entry already exists locally, replace it with the forced-pending one
+                        // only if the local one is also pending (so we don't overwrite a manually resolved outcome).
+                        // If the local one is already resolved (win/loss/expired), we keep it to preserve the verified result.
+                        if (match.status === 'pending') {
+                            byId.set(imp.id, imp);
+                            updated++;
+                        }
+                        // else: local is resolved, so we ignore the imported version.
                     }
                 });
 
                 const merged = Array.from(byId.values()).sort((a, b) => a.loggedAt - b.loggedAt);
                 saveJournal(merged);
                 renderJournal();
-                alert(`Import complete: ${added} new trade(s) added, ${updated} updated with resolved outcomes.`);
+                alert(`Import complete: ${added} new trade(s) added, ${updated} updated with pending status (all imported entries forced to pending). Use "Check Outcomes" to verify them.`);
             } catch (e) {
                 alert(`Could not import CSV: ${e.message}`);
             } finally {
