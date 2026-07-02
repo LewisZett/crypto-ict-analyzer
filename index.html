@@ -61,6 +61,7 @@
 <div class="note">
     <strong>Security:</strong> Your Gemini API key is sent directly from your browser and is never stored. Use only on a trusted device.
 </div>
+<div class="disclaimer" id="circuitBreakerStatus" style="display:none;"></div>
 
 <label for="geminiKey">Gemini API Key:</label>
 <input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
@@ -423,9 +424,72 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return price >= zone.lower && price <= zone.upper;
     }
 
-    // Hard local filter. Returns { pass, reason, sma, swing } - only coins
-    // that pass this trigger a Gemini call at all (Phase 2.2).
-    function passesLocalFilter(closesHTF, closesLTF, currentPrice, direction) {
+    // ------------------------------------------------------------------
+    // Order type (market vs limit). The local filter only confirms price
+    // is SOMEWHERE inside the 61.8%-78.6% OTE band - not that it's at the
+    // ideal price within that band. The classic ICT "sweet spot" is the
+    // 70.5% retracement. This tells the user whether current price is
+    // already at (or past) that sweet spot - meaning a market order now is
+    // reasonable - or whether it hasn't retraced far enough yet, in which
+    // case a resting limit order at the sweet-spot price is the correct
+    // way to enter without chasing.
+    // ------------------------------------------------------------------
+    const OTE_SWEET_SPOT_RATIO = 0.705;
+    const ORDER_TYPE_TOLERANCE_PCT = 0.15; // price within this % of the sweet spot counts as "there"
+
+    function computeOptimalEntry(high, low, direction) {
+        const range = high - low;
+        return direction === 'bullish'
+            ? high - range * OTE_SWEET_SPOT_RATIO
+            : low + range * OTE_SWEET_SPOT_RATIO;
+    }
+
+    // Bullish: a deeper pullback (lower price) is a BETTER price to buy at.
+    //   - If price has already reached (or gone below) the sweet spot, the
+    //     good price is already available now -> market order.
+    //   - If price is still above the sweet spot, place a resting BUY LIMIT
+    //     at the sweet spot and wait for the deeper pullback.
+    // Bearish is the mirror image (higher price is a better price to sell).
+    function determineOrderType(currentPrice, optimalEntry, direction) {
+        const distancePct = Math.abs(currentPrice - optimalEntry) / currentPrice * 100;
+        const alreadyThere = distancePct <= ORDER_TYPE_TOLERANCE_PCT;
+
+        let reachedOrBeyond;
+        if (direction === 'bullish') reachedOrBeyond = currentPrice <= optimalEntry;
+        else reachedOrBeyond = currentPrice >= optimalEntry;
+
+        const type = (alreadyThere || reachedOrBeyond) ? 'market' : 'limit';
+        const orderLabel = direction === 'bullish'
+            ? (type === 'market' ? 'Buy at current market price' : 'Place a BUY LIMIT order')
+            : (type === 'market' ? 'Sell at current market price' : 'Place a SELL LIMIT order');
+
+        return { type, entryPrice: type === 'market' ? currentPrice : optimalEntry, optimalEntry, distancePct, orderLabel };
+    }
+
+    // Minimum ratio of the most recent LTF volume bar to its trailing
+    // 20-bar average before a structural push is treated as "displacement"
+    // rather than a low-liquidity drift. 1.2x mirrors the reference
+    // threshold used by most ICT displacement checks - loose enough not to
+    // reject every setup, tight enough to filter obvious low-volume drift.
+    const VOLUME_DISPLACEMENT_RATIO = 1.2;
+
+    // Volume displacement check: in ICT terms a real Market Structure Shift
+    // needs heavy participation behind it, not just a price wiggle. Returns
+    // { ok, ratio } - ratio is also surfaced to the caller so it can be used
+    // later to RANK multiple simultaneous candidates by how much real
+    // volume is behind each one (see rankCandidatesByVolume).
+    function checkVolumeDisplacement(volumesLTF) {
+        if (!volumesLTF || volumesLTF.length < 20) return { ok: true, ratio: null }; // not enough data - don't block on it
+        const recentVolume = volumesLTF[volumesLTF.length - 1];
+        const avgVolume = volumesLTF.slice(-20).reduce((a, b) => a + b, 0) / 20;
+        if (avgVolume === 0) return { ok: true, ratio: null };
+        const ratio = recentVolume / avgVolume;
+        return { ok: ratio >= VOLUME_DISPLACEMENT_RATIO, ratio };
+    }
+
+    // Hard local filter. Returns { pass, reason, sma, swing, volumeRatio } -
+    // only coins that pass this trigger a Gemini call at all (Phase 2.2).
+    function passesLocalFilter(closesHTF, closesLTF, volumesLTF, currentPrice, direction) {
         const sma = calculateSMA(closesHTF, 20);
         if (sma === null) return { pass: false, reason: 'Insufficient HTF data for 20-period MA' };
 
@@ -441,19 +505,34 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
         if (!inOTE) return { pass: false, reason: 'Price not currently in 61.8-78.6% OTE zone (LTF filter failed)' };
 
-        return { pass: true, sma, swing };
+        const volCheck = checkVolumeDisplacement(volumesLTF);
+        if (!volCheck.ok) {
+            return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${VOLUME_DISPLACEMENT_RATIO}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
+        }
+
+        return { pass: true, sma, swing, volumeRatio: volCheck.ratio };
     }
+
+    // Fraction of the swing leg's total range used as the SL invalidation
+    // cushion. A fixed dollar/percent buffer is either too tight (gets
+    // wicked out on volatile alts) or too loose (wastes R on stable pairs
+    // like BTC) - scaling it to the actual leg size adapts to each coin's
+    // own volatility instead of using one number for every asset.
+    const STRUCTURAL_BUFFER_RATIO = 0.10;
 
     // Deterministic trade levels computed from local data (not from Gemini).
     function computeTradeLevels(direction, entry, swing, targetRR) {
+        const legSize = swing.high - swing.low;
+        const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
+
         if (direction === 'bullish') {
-            const sl = swing.low * 0.995;
+            const sl = swing.low - structuralBuffer;
             const risk = entry - sl;
             if (risk <= 0) return null;
             const tp = entry + risk * targetRR;
             return { entry, sl, tp, rr: targetRR };
         } else {
-            const sl = swing.high * 1.005;
+            const sl = swing.high + structuralBuffer;
             const risk = sl - entry;
             if (risk <= 0) return null;
             const tp = entry - risk * targetRR;
@@ -578,7 +657,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         // kline format: [openTime, open, high, low, close, volume, closeTime, ...]
         return raw.map(k => ({
             openTime: k[0], closeTime: k[6],
-            high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4])
+            high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]),
+            volume: parseFloat(k[5])
         }));
     }
 
@@ -613,6 +693,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return {
             closesHTF: klines1h.map(k => k.close),
             closesLTF: klines5m.map(k => k.close),
+            volumesLTF: klines5m.map(k => k.volume),
             dataQuality: {
                 stale: htfStale.stale || ltfStale.stale,
                 htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
@@ -659,26 +740,37 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return htfKlines.slice(Math.max(0, lo - count), lo).map(k => k.close);
     }
 
+    // Round-trip drag from exchange fees + slippage. 0.15% approximates
+    // Binance spot taker fees plus a modest slippage allowance. Backtests
+    // that assume a perfect fill at the exact marker line and zero cost
+    // are unrealistic - this converts that flat % cost into an equivalent
+    // R deduction (relative to the trade's own risk distance) and applies
+    // it uniformly to wins, losses, and timeouts, since every trade pays
+    // the entry+exit cost regardless of how it resolves.
+    const TRADING_FRICTION_PCT = 0.0015;
+
     function simulateTradeOutcome(ltfKlines, entryIndex, direction, levels, maxHoldBars) {
         const endIndex = Math.min(entryIndex + maxHoldBars, ltfKlines.length - 1);
+        const riskPerUnit = Math.abs(levels.entry - levels.sl);
+        const frictionR = riskPerUnit > 0 ? (levels.entry * TRADING_FRICTION_PCT) / riskPerUnit : 0;
+
         for (let j = entryIndex + 1; j <= endIndex; j++) {
             const bar = ltfKlines[j];
             if (direction === 'bullish') {
-                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1, exitIndex: j };
-                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr, exitIndex: j };
+                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, exitIndex: j };
+                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, exitIndex: j };
             } else {
-                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1, exitIndex: j };
-                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr, exitIndex: j };
+                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, exitIndex: j };
+                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, exitIndex: j };
             }
         }
         // Timed out before hitting either level - mark to market for a
         // partial (possibly negative) R result rather than discarding it.
-        const risk = Math.abs(levels.entry - levels.sl);
         const lastClose = ltfKlines[endIndex].close;
-        const rrAchieved = direction === 'bullish'
-            ? (lastClose - levels.entry) / risk
-            : (levels.entry - lastClose) / risk;
-        return { outcome: 'timeout', rrAchieved, exitIndex: endIndex };
+        const rrAchievedRaw = direction === 'bullish'
+            ? (lastClose - levels.entry) / riskPerUnit
+            : (levels.entry - lastClose) / riskPerUnit;
+        return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, exitIndex: endIndex };
     }
 
     // Walks forward through LTF candles for one direction, only searching
@@ -692,10 +784,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const bar = ltfKlines[i];
             const closesHTFasOf = getHTFSliceAsOf(htfKlines, bar.closeTime, 168);
             const closesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1).map(k => k.close);
+            const volumesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1).map(k => k.volume);
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, closesLTFasOf, currentPrice, direction);
+                const filterResult = passesLocalFilter(closesHTFasOf, closesLTFasOf, volumesLTFasOf, currentPrice, direction);
                 if (filterResult.pass) {
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
                     if (levels) {
@@ -829,7 +922,22 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function saveJournal(journal) {
         try {
             localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal.slice(-JOURNAL_MAX_ENTRIES)));
-        } catch (e) { console.error('Journal save failed:', e); }
+        } catch (e) {
+            console.warn('Journal storage quota hit - shedding oldest entries to keep new signals saving.', e);
+            // QuotaExceededError or similar - aggressively drop the oldest
+            // 20% and retry once rather than silently losing the newest
+            // live signal, which is the one the user actually needs.
+            if (journal.length > 20) {
+                const trimmed = journal.slice(Math.floor(journal.length * 0.20));
+                try {
+                    localStorage.setItem(JOURNAL_KEY, JSON.stringify(trimmed));
+                } catch (innerErr) {
+                    console.error('Critical journal storage failure - could not save even after trimming:', innerErr);
+                }
+            } else {
+                console.error('Critical journal storage failure:', e);
+            }
+        }
     }
 
     // Called automatically for every successful trade card a live run produces.
@@ -850,6 +958,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
             riskAmount: trade.riskAmount,
             dataAgeMinutes: trade.dataAgeMinutes,
             newsCheck: trade.newsCheck || null,
+            orderType: trade.orderType || null,
+            orderLabel: trade.orderLabel || null,
+            currentPrice: trade.currentPrice !== undefined ? parseFloat(trade.currentPrice) : null,
+            distancePct: trade.distancePct !== undefined ? trade.distancePct : null,
+            volumeRatio: trade.volumeRatio !== undefined ? trade.volumeRatio : null,
             loggedAt: Date.now(),
             status: 'pending',
             resolvedAt: null,
@@ -894,11 +1007,17 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 ? `${e.units} ${e.symbol} (~$${e.positionUSD} notional, risking ~$${e.riskAmount})`
                 : 'Position sizing not recorded for this entry (logged before this field was added).';
             const resolvedText = e.resolvedAt ? ` | Resolved: ${new Date(e.resolvedAt).toLocaleString()}` : '';
+            const orderText = e.orderType
+                ? `${e.orderType.toUpperCase()}${e.currentPrice !== null ? ` (price at signal: $${e.currentPrice})` : ''}`
+                : 'Not recorded for this entry.';
+            const volText = (e.volumeRatio !== null && e.volumeRatio !== undefined) ? `${e.volumeRatio.toFixed(2)}x 20-bar avg` : 'n/a';
             return `
                 <details class="row" style="background:#fafafa; border-radius:4px; padding:4px 8px; margin-bottom:4px;">
                     <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
                     <div class="row" style="margin-top:6px;">Entry: $${e.entry} | SL: $${e.sl} | TP: $${e.tp} | RR: ${e.rr}:1</div>
+                    <div class="row">Order type: ${orderText}</div>
                     <div class="row">Position: ${sizingText}</div>
+                    <div class="row">Volume displacement at signal: ${volText}</div>
                     <div class="row">AI context read (unvalidated) at time of signal: ${e.confidence}</div>
                     <div class="row muted">${e.notes || 'No notes recorded.'}</div>
                     ${e.newsCheck ? renderNewsSection(e.newsCheck) : '<div class="row muted">News check: not recorded for this entry.</div>'}
@@ -971,6 +1090,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         } finally {
             btn.disabled = false;
             renderJournal();
+            checkCircuitBreaker(getConfig());
+            renderCircuitBreakerStatus();
         }
     }
 
@@ -980,16 +1101,107 @@ After searching, respond with ONLY this JSON object and no other text before or 
         renderJournal();
     }
 
+    // ------------------------------------------------------------------
+    // Rolling daily circuit breaker. If the journal shows a net realized
+    // loss greater than 3% of account balance within a trailing 24-hour
+    // window, new order entries are blocked for a full 24 hours from the
+    // moment the breach is detected - this is a hard stop meant to save
+    // capital when the market regime shifts from clean trends into chop,
+    // regardless of how confident any individual signal looks.
+    // ------------------------------------------------------------------
+    const CIRCUIT_BREAKER_KEY = 'ictSniper_circuitBreaker';
+    const CIRCUIT_BREAKER_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const CIRCUIT_BREAKER_LOSS_PCT = 3;
+
+    function loadBreakerState() {
+        try {
+            const raw = localStorage.getItem(CIRCUIT_BREAKER_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) { return null; }
+    }
+
+    function saveBreakerState(state) {
+        try {
+            if (state === null) localStorage.removeItem(CIRCUIT_BREAKER_KEY);
+            else localStorage.setItem(CIRCUIT_BREAKER_KEY, JSON.stringify(state));
+        } catch (e) { console.error('Circuit breaker save failed:', e); }
+    }
+
+    // Sums realized $ P/L (rrAchieved * riskAmount) for journal entries
+    // resolved within the trailing window. Only entries with a recorded
+    // riskAmount are counted - older entries logged before position sizing
+    // was tracked can't be priced in $ terms and are skipped rather than
+    // guessed at.
+    function getRollingPnL(journal, windowMs) {
+        const cutoff = Date.now() - windowMs;
+        return journal
+            .filter(e => e.resolvedAt && e.resolvedAt >= cutoff && e.rrAchieved !== null && typeof e.riskAmount === 'number')
+            .reduce((sum, e) => sum + (e.rrAchieved * e.riskAmount), 0);
+    }
+
+    // Checks (and if needed, arms) the breaker. Returns { blocked, message }.
+    // Call this at the start of every run, before any API calls are made.
+    function checkCircuitBreaker(config) {
+        const existing = loadBreakerState();
+        const now = Date.now();
+
+        if (existing && now < existing.expiresAt) {
+            const remainingMin = Math.ceil((existing.expiresAt - now) / 60000);
+            const hrs = Math.floor(remainingMin / 60), mins = remainingMin % 60;
+            return {
+                blocked: true,
+                message: `Circuit breaker active: rolling 24h loss hit ${existing.lossPct.toFixed(1)}% of account on ${new Date(existing.triggeredAt).toLocaleString()}. New order entries are paused for ${hrs}h ${mins}m more.`
+            };
+        }
+
+        // Breaker expired or never armed - clear stale state and re-check
+        // the rolling loss against the current journal.
+        if (existing) saveBreakerState(null);
+
+        const journal = loadJournal();
+        const pnl = getRollingPnL(journal, CIRCUIT_BREAKER_WINDOW_MS);
+        const lossPct = pnl < 0 ? (Math.abs(pnl) / config.accountBalance) * 100 : 0;
+
+        if (lossPct >= CIRCUIT_BREAKER_LOSS_PCT) {
+            const state = { triggeredAt: now, expiresAt: now + CIRCUIT_BREAKER_WINDOW_MS, lossPct };
+            saveBreakerState(state);
+            return {
+                blocked: true,
+                message: `Circuit breaker triggered: rolling 24h realized loss is ${lossPct.toFixed(1)}% of account (threshold ${CIRCUIT_BREAKER_LOSS_PCT}%). New order entries are paused for the next 24 hours to protect capital during this regime.`
+            };
+        }
+
+        return { blocked: false, message: null };
+    }
+
+    function renderCircuitBreakerStatus() {
+        const el = document.getElementById('circuitBreakerStatus');
+        if (!el) return;
+        const existing = loadBreakerState();
+        const now = Date.now();
+        if (existing && now < existing.expiresAt) {
+            const remainingMin = Math.ceil((existing.expiresAt - now) / 60000);
+            const hrs = Math.floor(remainingMin / 60), mins = remainingMin % 60;
+            el.style.display = 'block';
+            el.innerHTML = `<strong>Circuit breaker ACTIVE</strong> - rolling 24h loss reached ${existing.lossPct.toFixed(1)}% of account. Paused for ${hrs}h ${mins}m more.`;
+        } else {
+            el.style.display = 'none';
+            el.innerHTML = '';
+        }
+    }
+
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,notes\n';
+        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,notes\n';
         const rows = journal.map(e => [
             e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
             e.rrAchieved !== null ? e.rrAchieved.toFixed(4) : '',
             e.units !== undefined ? e.units : '', e.positionUSD !== undefined ? e.positionUSD : '',
             e.riskAmount !== undefined ? e.riskAmount : '', e.dataAgeMinutes !== undefined ? e.dataAgeMinutes : '',
+            e.orderType || '', e.currentPrice !== null && e.currentPrice !== undefined ? e.currentPrice : '',
+            e.volumeRatio !== null && e.volumeRatio !== undefined ? e.volumeRatio.toFixed(4) : '',
             `"${(e.notes || '').replace(/"/g, '""')}"`
         ].join(',')).join('\n');
         const blob = new Blob([header + rows], { type: 'text/csv' });
@@ -1061,6 +1273,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         positionUSD: numOrUndefined('positionUSD'),
                         riskAmount: numOrUndefined('riskAmount'),
                         dataAgeMinutes: numOrUndefined('dataAgeMinutes'),
+                        orderType: get('orderType') || null,
+                        currentPrice: numOrUndefined('currentPrice') ?? null,
+                        volumeRatio: numOrUndefined('volumeRatio') ?? null,
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
                         // Force all imported entries to pending, with no resolved outcome.
                         status: 'pending',
@@ -1166,6 +1381,22 @@ Respond ONLY with valid JSON, no extra text:
         `;
     }
 
+    function renderOrderTypeSection(trade) {
+        if (!trade.orderType) return '';
+        const badgeColor = trade.orderType === 'market' ? '#28a745' : '#f5a623';
+        const badgeText = trade.orderType === 'market' ? 'MARKET ORDER' : 'LIMIT ORDER';
+        const detail = trade.orderType === 'market'
+            ? `Price is already at (or past) the 70.5% OTE sweet spot - enter at current market price (~$${trade.currentPrice}).`
+            : `Price hasn't retraced to the 70.5% OTE sweet spot yet (currently ~$${trade.currentPrice}, ${trade.distancePct !== undefined ? trade.distancePct.toFixed(2) : '?'}% away). Place a resting limit order at $${trade.entry} instead of chasing.`;
+        return `<div class="row"><strong style="color:${badgeColor}">[${badgeText}]</strong> ${trade.orderLabel || ''} @ $${trade.entry}</div>
+                <div class="row muted">${detail}</div>`;
+    }
+
+    function renderVolumeSection(trade) {
+        if (trade.volumeRatio === null || trade.volumeRatio === undefined) return '';
+        return `<div class="row muted">Volume displacement: ${trade.volumeRatio.toFixed(2)}x the 20-bar average (institutional threshold: ${VOLUME_DISPLACEMENT_RATIO}x)</div>`;
+    }
+
     function renderTradeCard(trade) {
         const cards = document.getElementById('cards');
         const cls = trade.direction === 'Long' ? 'long' : 'short';
@@ -1173,9 +1404,11 @@ Respond ONLY with valid JSON, no extra text:
         div.className = `card ${cls}`;
         div.innerHTML = `
             <h3>${trade.name} (${trade.symbol}) - ${trade.direction}</h3>
+            ${renderOrderTypeSection(trade)}
             <div class="row">Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | RR: ${trade.rr}:1</div>
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
+            ${renderVolumeSection(trade)}
             <div class="row muted">${trade.notes}</div>
             <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
             ${renderNewsSection(trade.newsCheck)}
@@ -1183,12 +1416,38 @@ Respond ONLY with valid JSON, no extra text:
         cards.appendChild(div);
     }
 
+    // Re-sorts the rendered cards (and the underlying lastValidTrades
+    // arrays) by volume ratio, strongest institutional displacement first.
+    // Called once after a run completes so that when several setups
+    // trigger in the same scan, the ones most likely to be real
+    // displacement (rather than low-liquidity drift) are surfaced first.
+    function rankAndRerenderCards() {
+        const byVolumeDesc = (a, b) => (b.volumeRatio || 0) - (a.volumeRatio || 0);
+        lastValidTrades.longs.sort(byVolumeDesc);
+        lastValidTrades.shorts.sort(byVolumeDesc);
+
+        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts].sort(byVolumeDesc);
+        const cardsEl = document.getElementById('cards');
+        cardsEl.innerHTML = '';
+        all.forEach((trade, i) => {
+            renderTradeCard(trade);
+            if (i === 0 && trade.volumeRatio) {
+                const lastCard = cardsEl.lastElementChild;
+                const badge = document.createElement('div');
+                badge.className = 'row success';
+                badge.innerHTML = '<strong>&#9733; Top pick this run (highest volume displacement)</strong>';
+                lastCard.prepend(badge);
+            }
+        });
+    }
+
     function tradePlanText() {
         const lines = ['=== ICT Sniper Trade Plan ==='];
         const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
         if (all.length === 0) return 'No valid trades found this run.';
         all.forEach((t, i) => {
-            lines.push(`${i + 1}. ${t.direction} ${t.symbol} | Entry: $${t.entry} | SL: $${t.sl} | TP: $${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | ${t.notes}`);
+            const orderTag = t.orderType ? `${t.orderType.toUpperCase()} @ $${t.entry}` : `Entry: $${t.entry}`;
+            lines.push(`${i + 1}. ${t.direction} ${t.symbol} | ${orderTag} | SL: $${t.sl} | TP: $${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Vol: ${t.volumeRatio ? t.volumeRatio.toFixed(2) + 'x' : 'n/a'} | ${t.notes}`);
         });
         return lines.join('\n');
     }
@@ -1239,10 +1498,19 @@ Respond ONLY with valid JSON, no extra text:
             };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.closesLTF, currentPrice, direction);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.closesLTF, candles.volumesLTF, currentPrice, direction);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
-        const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, config.targetRR);
+        // Decide whether this is a "buy/sell now" (market) or "wait for a
+        // better price" (limit) setup. The local filter only confirms price
+        // is somewhere in the 61.8-78.6% OTE band; this pinpoints whether
+        // it's already at the 70.5% sweet spot or still needs to retrace
+        // further, and computes trade levels off whichever price the user
+        // will actually be filled at.
+        const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
+        const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
+
+        const levels = computeTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config.targetRR);
         if (!levels) return { success: false, reason: 'Computed risk distance was zero/invalid - skipped' };
 
         const prompt = buildPrompt(coin, direction, currentPrice.toFixed(6), filterResult, sessionInfo, change24h);
@@ -1297,7 +1565,12 @@ Respond ONLY with valid JSON, no extra text:
                 notes: `${analysis.notes} | 24h: ${change24h}%`,
                 direction: direction === 'bullish' ? 'Long' : 'Short',
                 dataAgeMinutes: Math.max(candles.dataQuality.htfAgeMinutes, candles.dataQuality.ltfAgeMinutes),
-                newsCheck
+                newsCheck,
+                orderType: orderInfo.type,
+                orderLabel: orderInfo.orderLabel,
+                currentPrice: currentPrice.toFixed(6),
+                distancePct: orderInfo.distancePct,
+                volumeRatio: filterResult.volumeRatio
             }
         };
     }
@@ -1321,6 +1594,14 @@ Respond ONLY with valid JSON, no extra text:
 
         saveConfig();
         const config = getConfig();
+
+        const breaker = checkCircuitBreaker(config);
+        renderCircuitBreakerStatus();
+        if (breaker.blocked) {
+            log(breaker.message, 'error');
+            log('No new order entries will be scanned until the breaker clears. This is a capital-protection pause, not a bug.', 'error');
+            return;
+        }
 
         isRunning = true;
         currentController = new AbortController();
@@ -1376,7 +1657,6 @@ Respond ONLY with valid JSON, no extra text:
                 if (result.success) {
                     if (result.trade.direction === 'Long') lastValidTrades.longs.push(result.trade);
                     else lastValidTrades.shorts.push(result.trade);
-                    renderTradeCard(result.trade);
                     logTradeToJournal(result.trade);
                     const newsNote = result.trade.newsCheck
                         ? ` | News: ${result.trade.newsCheck.riskLevel}${result.trade.newsCheck.riskLevel === 'unchecked' ? ' (check failed - verify manually)' : ''}`
@@ -1392,10 +1672,15 @@ Respond ONLY with valid JSON, no extra text:
             setProgress(total, total, 'Done');
             log('\n=== Run complete ===');
             renderJournal();
+            renderCircuitBreakerStatus();
             log(`Long setups: ${lastValidTrades.longs.length} | Short setups: ${lastValidTrades.shorts.length}`);
             if (lastValidTrades.longs.length === 0 && lastValidTrades.shorts.length === 0) {
                 log('No valid trades this run. Try lowering the momentum threshold in Settings, or re-run during a kill zone.');
             } else {
+                rankAndRerenderCards();
+                if (lastValidTrades.longs.length + lastValidTrades.shorts.length > 1) {
+                    log('Multiple setups triggered this run - cards above are ranked by volume displacement (strongest institutional push first).', 'success');
+                }
                 document.getElementById('copyBtn').style.display = 'block';
             }
             log('\nReminder: verify every setup manually before acting. AI output is context, not certainty.', 'error');
@@ -1426,6 +1711,7 @@ Respond ONLY with valid JSON, no extra text:
 
     loadConfig();
     renderJournal();
+    renderCircuitBreakerStatus();
 </script>
 </body>
 </html>
