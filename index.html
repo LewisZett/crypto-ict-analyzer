@@ -1,377 +1,1220 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto ICT Sniper App</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 10px; background: #f4f4f4; }
-        button { background: #007bff; color: white; padding: 10px; border: none; border-radius: 5px; width: 100%; font-size: 16px; }
-        #output { margin-top: 20px; white-space: pre-wrap; background: white; padding: 10px; border-radius: 5px; overflow: auto; }
-        h1, h2 { color: #333; }
-        .error { color: red; }
-        .success { color: green; }
-        input { width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #ccc; border-radius: 5px; }
-        .long { color: green; font-weight: bold; }
-        .short { color: red; font-weight: bold; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto ICT Sniper App</title>
+<style>
+    body { font-family: Arial, sans-serif; margin: 10px; background: #f4f4f4; }
+    h1, h2, h3 { color: #333; }
+    .note { background: #fff8e1; border-left: 4px solid #f5a623; padding: 8px 10px; font-size: 13px; margin: 10px 0; }
+    .disclaimer { background: #fdecea; border-left: 4px solid #e53935; padding: 8px 10px; font-size: 13px; margin: 10px 0; }
+    label { font-size: 13px; font-weight: bold; display: block; margin-top: 8px; }
+    input, select { width: 100%; padding: 8px; margin: 4px 0; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 14px; }
+    .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+    button { background: #007bff; color: white; padding: 10px; border: none; border-radius: 5px; width: 100%; font-size: 16px; margin-top: 8px; cursor: pointer; }
+    button:disabled { background: #99c2ff; cursor: not-allowed; }
+    #cancelBtn { background: #dc3545; display: none; }
+    #copyBtn { background: #28a745; display: none; }
+    .progress-wrap { background: #ddd; border-radius: 5px; margin-top: 10px; overflow: hidden; height: 20px; display: none; }
+    .progress-bar { background: #007bff; height: 100%; width: 0%; transition: width 0.2s; text-align: center; color: white; font-size: 12px; line-height: 20px; }
+    #log { margin-top: 15px; white-space: pre-wrap; background: white; padding: 10px; border-radius: 5px; overflow: auto; font-size: 13px; max-height: 260px; }
+    #cards { margin-top: 15px; }
+    .card { background: white; border-radius: 6px; padding: 12px; margin-bottom: 10px; border-left: 5px solid #999; }
+    .card.long { border-left-color: #28a745; }
+    .card.short { border-left-color: #dc3545; }
+    .card h3 { margin: 0 0 6px 0; }
+    .card .row { font-size: 13px; margin: 2px 0; }
+    .error { color: #dc3545; }
+    .success { color: #28a745; }
+    .muted { color: #777; font-size: 12px; }
+    details { background: white; border-radius: 5px; padding: 8px; margin-top: 10px; }
+</style>
 </head>
 <body>
-    <h1>Crypto ICT Price Action Analysis App</h1>
-    <p>Now integrated with Google Gemini AI for advanced ICT analysis (requires free API key from <a href="https://aistudio.google.com/app/apikey" target="_blank">Google AI Studio</a>).</p>
-    <label for="geminiKey">Gemini API Key:</label>
-    <input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
-    <button onclick="runAnalysis()">Run ICT Analysis (Both Bullish & Bearish)</button>
-    <div id="output"></div>
 
-    <script>
-        // No API key needed for public mode
-        const API_KEY = ''; // Empty for free public API
-        const BASE_URL = 'https://api.coingecko.com/api/v3'; // Public endpoint
-        const HEADERS = {}; // No auth headers
+<!--
+    README / USAGE NOTES
+    ---------------------
+    1. Get a free Gemini API key from https://aistudio.google.com/app/apikey
+    2. This app runs entirely in your browser (no backend/server). Your Gemini
+       key is sent directly from your browser to Google and is never stored
+       or transmitted anywhere else.
+    3. Market screening data comes from CoinGecko's free public API (one call
+       per run). Per-coin candle/price history comes from Binance's public
+       API, which does not require a key and has much higher rate limits
+       than CoinGecko's free tier - this is why candle data was moved off
+       CoinGecko.
+    4. Not every coin in the CoinGecko top-50 has a matching USDT pair on
+       Binance. Those coins are skipped with a clear reason rather than
+       causing an error.
+    5. This tool is for education/research only. It is not financial advice.
+       All AI-assisted output should be manually verified before use.
+-->
 
-        let GEMINI_API_KEY = '';
+<h1>Crypto ICT Price Action Analysis App</h1>
+<p>Screens the CoinGecko top 50 by market cap, filters for momentum + local ICT-style confluence (moving average, market structure, Fibonacci OTE) computed in JavaScript, then asks Gemini AI to judge context/session quality only for candidates that already pass the hard technical rules.</p>
 
-        async function callGemini(prompt) {
-            if (!GEMINI_API_KEY) {
-                throw new Error('Gemini API key not provided');
+<div class="disclaimer">
+    <strong>Disclaimer:</strong> Educational/research tool only. Not financial advice. AI-generated trade plans must be manually verified before acting on them.
+</div>
+<div class="note">
+    <strong>Security:</strong> Your Gemini API key is sent directly from your browser and is never stored. Use only on a trusted device.
+</div>
+
+<label for="geminiKey">Gemini API Key:</label>
+<input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
+
+<details>
+    <summary><strong>Settings</strong> (risk, thresholds, timezone)</summary>
+    <div class="config-grid">
+        <div>
+            <label for="accountBalance">Account Balance (USD)</label>
+            <input type="number" id="accountBalance" value="1000" min="1">
+        </div>
+        <div>
+            <label for="riskPercent">Risk per Trade (%)</label>
+            <input type="number" id="riskPercent" value="1" min="0.1" step="0.1">
+        </div>
+        <div>
+            <label for="momentumThreshold">Momentum Threshold (24h %)</label>
+            <input type="number" id="momentumThreshold" value="3" min="0.1" step="0.1">
+        </div>
+        <div>
+            <label for="targetRR">Target Risk:Reward</label>
+            <input type="number" id="targetRR" value="3" min="1" step="0.5">
+        </div>
+        <div>
+            <label for="candidateCount">Candidates per side (max)</label>
+            <input type="number" id="candidateCount" value="10" min="1" max="25">
+        </div>
+        <div>
+            <label for="displayTimezone">Display Timezone</label>
+            <select id="displayTimezone">
+                <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
+                <option value="local">Browser Local Time</option>
+                <option value="UTC">UTC</option>
+                <option value="Europe/London">Europe/London</option>
+                <option value="America/New_York">America/New_York</option>
+                <option value="Asia/Tokyo">Asia/Tokyo</option>
+            </select>
+        </div>
+    </div>
+</details>
+
+<button id="runBtn" onclick="runAnalysis()">Run ICT Analysis (Both Bullish &amp; Bearish)</button>
+<button id="cancelBtn" onclick="cancelAnalysis()">Cancel</button>
+
+<details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
+    <summary><strong>Backtest (no API key needed)</strong> - tests the local filter logic against recent historical data</summary>
+    <p class="muted">This does NOT call Gemini - it only replays the deterministic MA/structure/OTE/SL/TP rules against past candles, so you can see how the filter itself would have performed before trusting any of its live signals.</p>
+    <label for="backtestSymbol">Symbol (must have a Binance USDT pair)</label>
+    <input type="text" id="backtestSymbol" placeholder="e.g. BTC, ETH, SOL" value="BTC">
+    <button id="backtestBtn" onclick="runBacktest()">Run Backtest</button>
+    <div id="backtestResults" style="margin-top:8px;"></div>
+    <div id="backtestLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:220px; overflow:auto;"></div>
+</details>
+
+<details open style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
+    <summary><strong>Trade Journal</strong> - every recommendation from a live run is saved here automatically</summary>
+    <p class="muted">Nothing here is graded until you click "Check Outcomes" - that pulls the real candles that happened after each trade was logged and checks whether price actually hit TP or SL. This is the honest record of how live signals did; the cards above are not.</p>
+    <div id="journalSummary"></div>
+    <button id="journalCheckBtn" onclick="checkJournalOutcomes()">Check Outcomes</button>
+    <button onclick="exportJournalCSV()" style="background:#6c757d;">Export CSV</button>
+    <button onclick="document.getElementById('journalImportInput').click()" style="background:#6c757d;">Import CSV</button>
+    <input type="file" id="journalImportInput" accept=".csv" style="display:none" onchange="importJournalCSV(event)">
+    <button onclick="clearJournal()" style="background:#dc3545;">Clear Journal</button>
+    <div id="journalLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:180px; overflow:auto;"></div>
+    <div id="journalList" style="margin-top:8px; max-height:280px; overflow:auto; font-size:13px;"></div>
+</details>
+
+<div class="progress-wrap" id="progressWrap">
+    <div class="progress-bar" id="progressBar">0%</div>
+</div>
+
+<div id="log"></div>
+<div id="cards"></div>
+<button id="copyBtn" onclick="copyTradePlan()">Copy Trade Plan</button>
+
+<script>
+    // ------------------------------------------------------------------
+    // Config persistence (never persist the API key)
+    // ------------------------------------------------------------------
+    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'displayTimezone'];
+
+    function loadConfig() {
+        CONFIG_KEYS.forEach(key => {
+            const saved = localStorage.getItem('ictSniper_' + key);
+            if (saved !== null) {
+                const el = document.getElementById(key);
+                if (el) el.value = saved;
             }
-            const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
-            const body = {
-                contents: [{
-                    parts: [{ text: prompt }]
-                }]
-            };
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': GEMINI_API_KEY
-                },
-                body: JSON.stringify(body)
-            });
-            if (!res.ok) {
-                const errorText = await res.text();
-                throw new Error(`Gemini API error (${res.status}): ${errorText}`);
-            }
-            const data = await res.json();
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!text) {
-                throw new Error('No response from Gemini');
-            }
-            // Extract JSON from response (handle markdown if present)
-            const jsonMatch = text.match(/```json\s*(\{.*?\})\s*```/s) || [null, text.trim()];
+        });
+    }
+
+    function saveConfig() {
+        CONFIG_KEYS.forEach(key => {
+            const el = document.getElementById(key);
+            if (el) localStorage.setItem('ictSniper_' + key, el.value);
+        });
+    }
+
+    function getConfig() {
+        return {
+            accountBalance: parseFloat(document.getElementById('accountBalance').value) || 1000,
+            riskPercent: parseFloat(document.getElementById('riskPercent').value) || 1,
+            momentumThreshold: parseFloat(document.getElementById('momentumThreshold').value) || 3,
+            targetRR: parseFloat(document.getElementById('targetRR').value) || 3,
+            candidateCount: Math.max(1, Math.min(25, parseInt(document.getElementById('candidateCount').value) || 10)),
+            displayTimezone: document.getElementById('displayTimezone').value
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Generic helpers
+    // ------------------------------------------------------------------
+    const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
+    const BINANCE_BASE = 'https://api.binance.com/api/v3';
+
+    let isRunning = false;
+    let currentController = null;
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // Fetch with 429 retry/backoff. Honors AbortController signal passed via options.signal.
+    async function fetchWithRetry(url, options = {}, maxRetries = 2) {
+        let attempt = 0;
+        while (true) {
+            let res;
             try {
-                return JSON.parse(jsonMatch[1]);
-            } catch (e) {
-                throw new Error(`Failed to parse JSON from Gemini: ${e.message}`);
+                res = await fetch(url, options);
+            } catch (err) {
+                if (err.name === 'AbortError') throw err;
+                if (attempt < maxRetries) {
+                    await sleep(1500 * Math.pow(2, attempt));
+                    attempt++;
+                    continue;
+                }
+                throw err;
             }
+            if (res.ok) return res;
+            if (res.status === 429 && attempt < maxRetries) {
+                const retryAfter = res.headers.get('Retry-After');
+                const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 2000 * Math.pow(2, attempt);
+                await sleep(waitMs);
+                attempt++;
+                continue;
+            }
+            return res; // non-ok, non-retryable (or retries exhausted) - caller checks res.ok
+        }
+    }
+
+    function log(msg, cls) {
+        const el = document.getElementById('log');
+        el.innerHTML += cls ? `<span class="${cls}">${msg}</span>\n` : `${msg}\n`;
+        el.scrollTop = el.scrollHeight;
+    }
+
+    function setProgress(current, total, label) {
+        const wrap = document.getElementById('progressWrap');
+        const bar = document.getElementById('progressBar');
+        wrap.style.display = 'block';
+        const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+        bar.style.width = pct + '%';
+        bar.textContent = label || `${current}/${total}`;
+    }
+
+    // ------------------------------------------------------------------
+    // Gemini
+    // ------------------------------------------------------------------
+    async function callGeminiRaw(prompt, apiKey, signal) {
+        const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+        const body = { contents: [{ parts: [{ text: prompt }] }] };
+        const res = await fetchWithRetry(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify(body),
+            signal
+        });
+        if (!res.ok) {
+            const errorText = await res.text();
+            throw new Error(`Gemini API error (${res.status}): ${errorText.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error('No response text from Gemini');
+        return text;
+    }
+
+    function extractJSON(text) {
+        let match = text.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+        if (match) return JSON.parse(match[1]);
+        match = text.match(/(\{[\s\S]*\})/);
+        if (match) return JSON.parse(match[1]);
+        return JSON.parse(text.trim());
+    }
+
+    async function callGeminiJSON(prompt, apiKey, signal) {
+        const text = await callGeminiRaw(prompt, apiKey, signal);
+        try {
+            return extractJSON(text);
+        } catch (e) {
+            console.error('Gemini JSON parse failed. Raw response (first 200 chars):', text.slice(0, 200));
+            throw new Error(`Failed to parse JSON from Gemini: ${e.message}`);
+        }
+    }
+
+    async function testGeminiKey(apiKey, signal) {
+        try {
+            const text = await callGeminiRaw('Reply with exactly one word: OK', apiKey, signal);
+            return text.toUpperCase().includes('OK');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Local technical indicators (Phase 2: keep math out of the LLM)
+    // ------------------------------------------------------------------
+    function calculateSMA(closes, period) {
+        if (closes.length < period) return null;
+        const slice = closes.slice(-period);
+        return slice.reduce((a, b) => a + b, 0) / period;
+    }
+
+    function findSwingHighLow(closes, lookback) {
+        const slice = closes.slice(-lookback);
+        return { high: Math.max(...slice), low: Math.min(...slice) };
+    }
+
+    // ------------------------------------------------------------------
+    // Fractal swing-point detection (replaces the old "split the window in
+    // half and compare" heuristic). A bar is a swing high if it's the
+    // highest point among `wing` bars on either side of it; swing low is
+    // the mirror case. This is still a simplification of discretionary ICT
+    // structure reading (a real trader also weighs volume, wick rejection,
+    // liquidity sweeps, etc. that aren't in this data), but it is at least
+    // reading actual pivot sequences instead of two arbitrary buckets.
+    // ------------------------------------------------------------------
+    function findFractalSwings(closes, wing = 2) {
+        const highs = [], lows = [];
+        for (let i = wing; i < closes.length - wing; i++) {
+            const left = closes.slice(i - wing, i);
+            const right = closes.slice(i + 1, i + 1 + wing);
+            const isHigh = left.every(v => v <= closes[i]) && right.every(v => v < closes[i]);
+            const isLow = left.every(v => v >= closes[i]) && right.every(v => v > closes[i]);
+            if (isHigh) highs.push({ index: i, price: closes[i] });
+            if (isLow) lows.push({ index: i, price: closes[i] });
+        }
+        return { highs, lows };
+    }
+
+    // HH/HL vs LH/LL structure check using the last 3 confirmed swing highs
+    // and lows (needs at least 2 of each to compare sequences). Returns
+    // false (not "unknown") if there isn't enough pivot data - callers
+    // should treat that as "structure not confirmed", not as a pass.
+    function checkTrendStructure(closes, direction, lookback, wing = 2) {
+        const slice = closes.slice(-lookback);
+        const { highs, lows } = findFractalSwings(slice, wing);
+        if (highs.length < 2 || lows.length < 2) return false;
+
+        const lastTwoHighs = highs.slice(-2);
+        const lastTwoLows = lows.slice(-2);
+        const higherHigh = lastTwoHighs[1].price > lastTwoHighs[0].price;
+        const higherLow = lastTwoLows[1].price > lastTwoLows[0].price;
+        const lowerHigh = lastTwoHighs[1].price < lastTwoHighs[0].price;
+        const lowerLow = lastTwoLows[1].price < lastTwoLows[0].price;
+
+        if (direction === 'bullish') return higherHigh && higherLow;
+        return lowerHigh && lowerLow;
+    }
+
+    // OTE (Optimal Trade Entry) zone: 61.8%-78.6% Fibonacci retracement.
+    // Bullish: retracement measured down from swing high toward swing low.
+    // Bearish: retracement measured up from swing low toward swing high.
+    function getOTEZone(high, low, direction) {
+        const range = high - low;
+        if (direction === 'bullish') {
+            return { upper: high - range * 0.618, lower: high - range * 0.786 };
+        }
+        return { lower: low + range * 0.618, upper: low + range * 0.786 };
+    }
+
+    function isInOTEZone(price, high, low, direction) {
+        const zone = getOTEZone(high, low, direction);
+        return price >= zone.lower && price <= zone.upper;
+    }
+
+    // Hard local filter. Returns { pass, reason, sma, swing } - only coins
+    // that pass this trigger a Gemini call at all (Phase 2.2).
+    function passesLocalFilter(closesHTF, closesLTF, currentPrice, direction) {
+        const sma = calculateSMA(closesHTF, 20);
+        if (sma === null) return { pass: false, reason: 'Insufficient HTF data for 20-period MA' };
+
+        const maOk = direction === 'bullish' ? currentPrice > sma : currentPrice < sma;
+        if (!maOk) return { pass: false, reason: 'Price on wrong side of 20-period MA (MTF filter failed)' };
+
+        const structureOk = checkTrendStructure(closesHTF, direction, Math.min(50, closesHTF.length));
+        if (!structureOk) return { pass: false, reason: 'HTF structure does not show clear HH/HL or LH/LL' };
+
+        const swing = findSwingHighLow(closesLTF, Math.min(50, closesLTF.length));
+        if (swing.high === swing.low) return { pass: false, reason: 'No meaningful LTF price range to compute Fibonacci levels' };
+
+        const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
+        if (!inOTE) return { pass: false, reason: 'Price not currently in 61.8-78.6% OTE zone (LTF filter failed)' };
+
+        return { pass: true, sma, swing };
+    }
+
+    // Deterministic trade levels computed from local data (not from Gemini).
+    function computeTradeLevels(direction, entry, swing, targetRR) {
+        if (direction === 'bullish') {
+            const sl = swing.low * 0.995;
+            const risk = entry - sl;
+            if (risk <= 0) return null;
+            const tp = entry + risk * targetRR;
+            return { entry, sl, tp, rr: targetRR };
+        } else {
+            const sl = swing.high * 1.005;
+            const risk = sl - entry;
+            if (risk <= 0) return null;
+            const tp = entry - risk * targetRR;
+            return { entry, sl, tp, rr: targetRR };
+        }
+    }
+
+    function computePositionSize(entry, sl, accountBalance, riskPercent) {
+        const riskAmount = accountBalance * (riskPercent / 100);
+        const riskPerUnit = Math.abs(entry - sl);
+        if (riskPerUnit === 0) return { units: 0, positionUSD: 0, riskAmount };
+        const units = riskAmount / riskPerUnit;
+        const positionUSD = units * entry;
+        return { units, positionUSD, riskAmount };
+    }
+
+    // ------------------------------------------------------------------
+    // Kill zone / session logic (computed in UTC to avoid DST/locale bugs,
+    // displayed in the user's chosen timezone). Windows mirror standard
+    // approximate ICT session times; treat as approximate, not authoritative.
+    // ------------------------------------------------------------------
+    function getSessionInfo(displayTz) {
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        const utcMinute = now.getUTCMinutes();
+
+        const isLKZ = utcHour >= 7 && utcHour < 10;                                   // London KZ ~07:00-10:00 UTC
+        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15; // NY KZ ~13:30-16:00 UTC
+        const isAsian = utcHour >= 23 || utcHour < 7;                                 // Asian session ~23:00-07:00 UTC
+        const inKillZone = isLKZ || isNYKZ;
+
+        let displayTime;
+        try {
+            const tz = displayTz === 'local' ? Intl.DateTimeFormat().resolvedOptions().timeZone : displayTz;
+            displayTime = now.toLocaleTimeString('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }) + ' (' + tz + ')';
+        } catch (e) {
+            displayTime = now.toISOString().slice(11, 16) + ' UTC';
         }
 
-        async function runAnalysis() {
-            GEMINI_API_KEY = document.getElementById('geminiKey').value.trim();
-            const output = document.getElementById('output');
-            output.innerHTML = 'Analyzing... (may take 1-2 min due to API calls)\n';
-            
-            if (!GEMINI_API_KEY) {
-                output.innerHTML += '<span class="error">Please enter your Gemini API key!</span>\n';
+        return {
+            displayTime,
+            isLKZ, isNYKZ, isAsian, inKillZone,
+            summary: `Current time: ${displayTime} | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // CoinGecko: market screening only (Phase 1.1)
+    // ------------------------------------------------------------------
+    async function fetchTopMarkets(signal) {
+        const params = new URLSearchParams({
+            vs_currency: 'usd', order: 'market_cap_desc', per_page: 50, page: 1,
+            sparkline: false, price_change_percentage: '24h'
+        });
+        const res = await fetchWithRetry(`${COINGECKO_BASE}/coins/markets?${params}`, { signal });
+        if (!res.ok) throw new Error(`CoinGecko error (${res.status}): ${(await res.text()).slice(0, 200)}`);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error('Invalid CoinGecko response (not an array)');
+        return data;
+    }
+
+    // ------------------------------------------------------------------
+    // Binance: per-coin candle data (Phase 1.1 / 3.1)
+    // ------------------------------------------------------------------
+    function binanceSymbolFor(coin) {
+        return coin.symbol.toUpperCase() + 'USDT';
+    }
+
+    async function fetchKlines(symbol, interval, limit, signal, startTime) {
+        let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        if (startTime) url += `&startTime=${startTime}`;
+        const res = await fetchWithRetry(url, { signal });
+        if (!res.ok) return null; // e.g. no such pair on Binance - caller decides how to handle
+        const raw = await res.json();
+        // kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+        return raw.map(k => ({
+            openTime: k[0], closeTime: k[6],
+            high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4])
+        }));
+    }
+
+    // Expected max gap (ms) between "now" and the most recent CLOSED candle
+    // before we consider the feed stale. Generous buffer for network/clock
+    // skew, but tight enough to catch a genuinely frozen/cached feed.
+    const STALENESS_LIMITS_MS = { '1h': 2 * 60 * 60 * 1000, '5m': 15 * 60 * 1000 };
+
+    // Surfaces staleness instead of silently trusting whatever Binance
+    // returned. A frozen or delayed feed can still return 200 OK with
+    // well-formed (but old) candles - HTTP success doesn't mean the data
+    // is current.
+    function checkStaleness(klines, interval) {
+        if (!klines || klines.length === 0) return { stale: true, ageMs: Infinity };
+        const lastCloseTime = klines[klines.length - 1].closeTime;
+        const ageMs = Date.now() - lastCloseTime;
+        const limit = STALENESS_LIMITS_MS[interval] || 30 * 60 * 1000;
+        return { stale: ageMs > limit, ageMs };
+    }
+
+    async function fetchCoinCandles(coin, signal) {
+        const symbol = binanceSymbolFor(coin);
+        const [klines1h, klines5m] = await Promise.all([
+            fetchKlines(symbol, '1h', 168, signal),  // ~7 days of hourly data (HTF)
+            fetchKlines(symbol, '5m', 100, signal)   // ~8 hours of 5-min data (LTF)
+        ]);
+        if (!klines1h || !klines5m) return null;
+
+        const htfStale = checkStaleness(klines1h, '1h');
+        const ltfStale = checkStaleness(klines5m, '5m');
+
+        return {
+            closesHTF: klines1h.map(k => k.close),
+            closesLTF: klines5m.map(k => k.close),
+            dataQuality: {
+                stale: htfStale.stale || ltfStale.stale,
+                htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
+                ltfAgeMinutes: Math.round(ltfStale.ageMs / 60000)
+            }
+        };
+    }
+
+    // Cross-checks Binance's latest close against CoinGecko's current_price
+    // for the same coin. These come from two different providers on two
+    // different polling cycles, so some divergence is normal - but a large
+    // gap is a sign one of the feeds is stale, mismatched, or the pair
+    // mapping (symbol -> USDT pair) picked the wrong market. Threshold is
+    // deliberately loose (3%) to avoid false positives on volatile alts.
+    function checkPriceConsistency(coingeckoPrice, binancePrice) {
+        if (!coingeckoPrice || !binancePrice) return { consistent: true, diffPct: 0 };
+        const diffPct = Math.abs(coingeckoPrice - binancePrice) / coingeckoPrice * 100;
+        return { consistent: diffPct <= 3, diffPct };
+    }
+
+    // ------------------------------------------------------------------
+    // Backtest engine (Phase 6). Replays the LOCAL filter + deterministic
+    // trade-level logic (SMA / structure / OTE / SL / TP) against historical
+    // candles. This deliberately does NOT include Gemini - there's no way
+    // to retroactively ask an LLM what it would have said in the past
+    // without just making that up, so the backtest measures the part of
+    // the system that's actually reproducible: the hard technical filter.
+    // Gemini's confidence rating is not, and cannot be, backtested here -
+    // that's exactly why the card labels it "unvalidated."
+    //
+    // Limitation to be upfront about: this still assumes the fractal
+    // swing/structure read is a reasonable proxy for real ICT structure,
+    // and it can only tell you how THIS filter's rules would have performed
+    // on THIS data window - not whether ICT theory itself is sound, and not
+    // how it'll perform on data it hasn't seen yet.
+    // ------------------------------------------------------------------
+    function getHTFSliceAsOf(htfKlines, timestamp, count) {
+        // htfKlines assumed sorted ascending by closeTime (Binance default).
+        let lo = 0, hi = htfKlines.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (htfKlines[mid].closeTime <= timestamp) lo = mid + 1; else hi = mid;
+        }
+        return htfKlines.slice(Math.max(0, lo - count), lo).map(k => k.close);
+    }
+
+    function simulateTradeOutcome(ltfKlines, entryIndex, direction, levels, maxHoldBars) {
+        const endIndex = Math.min(entryIndex + maxHoldBars, ltfKlines.length - 1);
+        for (let j = entryIndex + 1; j <= endIndex; j++) {
+            const bar = ltfKlines[j];
+            if (direction === 'bullish') {
+                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1, exitIndex: j };
+                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr, exitIndex: j };
+            } else {
+                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1, exitIndex: j };
+                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr, exitIndex: j };
+            }
+        }
+        // Timed out before hitting either level - mark to market for a
+        // partial (possibly negative) R result rather than discarding it.
+        const risk = Math.abs(levels.entry - levels.sl);
+        const lastClose = ltfKlines[endIndex].close;
+        const rrAchieved = direction === 'bullish'
+            ? (lastClose - levels.entry) / risk
+            : (levels.entry - lastClose) / risk;
+        return { outcome: 'timeout', rrAchieved, exitIndex: endIndex };
+    }
+
+    // Walks forward through LTF candles for one direction, only searching
+    // for a new signal once any open position has resolved (no overlapping
+    // positions in the same direction - keeps the trade count honest).
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars) {
+        const trades = [];
+        const minHTF = 24, minLTFWindow = 50;
+        let i = minLTFWindow;
+        while (i < ltfKlines.length) {
+            const bar = ltfKlines[i];
+            const closesHTFasOf = getHTFSliceAsOf(htfKlines, bar.closeTime, 168);
+            const closesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1).map(k => k.close);
+
+            if (closesHTFasOf.length >= minHTF) {
+                const currentPrice = bar.close;
+                const filterResult = passesLocalFilter(closesHTFasOf, closesLTFasOf, currentPrice, direction);
+                if (filterResult.pass) {
+                    const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
+                    if (levels) {
+                        const result = simulateTradeOutcome(ltfKlines, i, direction, levels, maxHoldBars);
+                        trades.push({
+                            entryIndex: i,
+                            entryTime: bar.closeTime,
+                            entry: levels.entry, sl: levels.sl, tp: levels.tp,
+                            outcome: result.outcome, rrAchieved: result.rrAchieved
+                        });
+                        i = result.exitIndex + 1; // don't search for a new signal mid-position
+                        continue;
+                    }
+                }
+            }
+            i++;
+        }
+        return trades;
+    }
+
+    function summarizeBacktest(trades) {
+        if (trades.length === 0) {
+            return { count: 0, wins: 0, losses: 0, timeouts: 0, winRate: null, avgRR: null, maxDrawdownR: 0, totalR: 0 };
+        }
+        const wins = trades.filter(t => t.outcome === 'win').length;
+        const losses = trades.filter(t => t.outcome === 'loss').length;
+        const timeouts = trades.filter(t => t.outcome === 'timeout').length;
+        const decided = wins + losses;
+        const totalR = trades.reduce((sum, t) => sum + t.rrAchieved, 0);
+
+        // Max drawdown in R units, walking the equity curve in trade order.
+        let equity = 0, peak = 0, maxDD = 0;
+        trades.forEach(t => {
+            equity += t.rrAchieved;
+            peak = Math.max(peak, equity);
+            maxDD = Math.min(maxDD, equity - peak);
+        });
+
+        return {
+            count: trades.length, wins, losses, timeouts,
+            winRate: decided > 0 ? (wins / decided) * 100 : null,
+            avgRR: totalR / trades.length,
+            maxDrawdownR: maxDD,
+            totalR
+        };
+    }
+
+    async function runBacktest() {
+        const btBtn = document.getElementById('backtestBtn');
+        const btLog = document.getElementById('backtestLog');
+        const btResults = document.getElementById('backtestResults');
+        btResults.innerHTML = '';
+        btLog.innerHTML = '';
+        const btLogFn = (msg, cls) => {
+            btLog.innerHTML += cls ? `<span class="${cls}">${msg}</span>\n` : `${msg}\n`;
+            btLog.scrollTop = btLog.scrollHeight;
+        };
+
+        const rawSymbol = document.getElementById('backtestSymbol').value.trim().toUpperCase();
+        if (!rawSymbol) { btLogFn('Enter a symbol, e.g. BTC or ETH.', 'error'); return; }
+        const symbol = rawSymbol.endsWith('USDT') ? rawSymbol : rawSymbol + 'USDT';
+        const config = getConfig();
+        const maxHoldBars = 288; // 288 * 5m = 24h max hold before marking to market
+
+        btBtn.disabled = true;
+        try {
+            btLogFn(`Fetching historical data for ${symbol}...`);
+            const controller = new AbortController();
+            const [klines1h, klines5m] = await Promise.all([
+                fetchKlines(symbol, '1h', 500, controller.signal),   // ~20 days
+                fetchKlines(symbol, '5m', 1000, controller.signal)   // ~3.5 days
+            ]);
+            if (!klines1h || !klines5m) {
+                btLogFn(`No Binance USDT pair found for ${symbol}, or the fetch failed.`, 'error');
                 return;
             }
-            
-            try {
-                // Step 0: Get current time in GMT+2 (Johannesburg)
-                const now = new Date();
-                const saOptions = { timeZone: 'Africa/Johannesburg', hour: 'numeric', minute: 'numeric', hour12: false };
-                const saTime = now.toLocaleTimeString('en-US', saOptions);
-                const [hourStr, minStr] = saTime.split(':');
-                const hour = parseInt(hourStr);
-                const minute = parseInt(minStr);
-                const isLKZ = (hour >= 9 && hour < 12);
-                const isNYKZ = (hour >= 15 && (hour > 15 || minute >= 30) && hour < 18);
-                const isAsian = (hour >= 1 && hour < 9);
-                const inKillZone = isLKZ || isNYKZ;
-                const timeNote = `Current time: ${saTime} GMT+2 | Kill Zone: ${inKillZone ? 'Yes (High Prob)' : 'No (Use Asian Bias)'} | LKZ: ${isLKZ}, NYKZ: ${isNYKZ}, Asian: ${isAsian}`;
+            btLogFn(`Got ${klines1h.length} 1h candles (~${Math.round(klines1h.length / 24)} days) and ${klines5m.length} 5m candles (~${(klines5m.length * 5 / 60 / 24).toFixed(1)} days).`);
+            btLogFn('Replaying local filter logic bar-by-bar (no Gemini - this only tests the deterministic technical rules)...\n');
 
-                output.innerHTML += `${timeNote}\n`;
-                output.innerHTML += `Using Gemini AI for ICT analysis (API key set). Scanning both bullish (>3% 24h) and bearish (<-3% 24h) momentum.\n\n`;
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars);
+            const longStats = summarizeBacktest(longTrades);
+            const shortStats = summarizeBacktest(shortTrades);
+            const allStats = summarizeBacktest([...longTrades, ...shortTrades]);
 
-                // Fetch top 50 cryptos
-                const marketsUrl = `${BASE_URL}/coins/markets`;
-                const marketsParams = new URLSearchParams({
-                    vs_currency: 'usd',
-                    order: 'market_cap_desc',
-                    per_page: 50,
-                    page: 1,
-                    sparkline: false,
-                    price_change_percentage: '24h'
-                });
-                const marketsRes = await fetch(`${marketsUrl}?${marketsParams}`, { headers: HEADERS });
-                
-                if (!marketsRes.ok) {
-                    const errorText = await marketsRes.text();
-                    output.innerHTML += `<span class="error">API Error (${marketsRes.status}): ${errorText}</span>\n`;
-                    return;
+            function fmtStats(label, s) {
+                if (s.count === 0) return `${label}: 0 signals in this window.`;
+                return `${label}: ${s.count} signals | ${s.wins}W / ${s.losses}L / ${s.timeouts} timed out | `
+                    + `win rate (decided trades): ${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'} | `
+                    + `avg R per trade: ${s.avgRR.toFixed(2)} | total R: ${s.totalR.toFixed(2)} | max drawdown: ${s.maxDrawdownR.toFixed(2)}R`;
+            }
+
+            btLogFn(fmtStats('LONGS', longStats), 'success');
+            btLogFn(fmtStats('SHORTS', shortStats), 'success');
+            btLogFn(fmtStats('COMBINED', allStats), 'success');
+            btLogFn('\nRemember: this is one symbol, one recent data window (limited by how much history Binance\'s free klines endpoint returns), and it excludes Gemini entirely. Small sample sizes here are NOT a reliable estimate of edge - re-run across multiple symbols and time windows before drawing conclusions.', 'error');
+
+            btResults.innerHTML = `
+                <div class="row"><strong>${symbol} backtest (targetRR ${config.targetRR}:1)</strong></div>
+                <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
+                <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
+            `;
+        } catch (e) {
+            btLogFn(`Backtest error: ${e.message}`, 'error');
+        } finally {
+            btBtn.disabled = false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-journal (persisted trade log with later outcome checking).
+    // Every trade a live run recommends gets saved locally as "pending."
+    // "Check Outcomes" later fetches the ACTUAL 5m candles that happened
+    // since each trade was logged (not a simulation) and walks them to see
+    // whether price touched SL or TP first, same win/loss logic as the
+    // backtest engine but against real forward data. This is the only
+    // trustworthy record of how live recommendations actually did - the
+    // cards themselves are not proof of anything until checked here.
+    // ------------------------------------------------------------------
+    const JOURNAL_KEY = 'ictSniper_journal';
+    const JOURNAL_MAX_ENTRIES = 300;
+    const JOURNAL_MAX_HOLD_MS = 48 * 60 * 60 * 1000; // mark-to-market if untouched after 48h
+
+    function loadJournal() {
+        try {
+            const raw = localStorage.getItem(JOURNAL_KEY);
+            return raw ? JSON.parse(raw) : [];
+        } catch (e) { return []; }
+    }
+
+    function saveJournal(journal) {
+        try {
+            localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal.slice(-JOURNAL_MAX_ENTRIES)));
+        } catch (e) { console.error('Journal save failed:', e); }
+    }
+
+    // Called automatically for every successful trade card a live run produces.
+    function logTradeToJournal(trade) {
+        const journal = loadJournal();
+        journal.push({
+            id: `${trade.symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            symbol: trade.symbol,
+            direction: trade.direction, // 'Long' or 'Short'
+            entry: parseFloat(trade.entry),
+            sl: parseFloat(trade.sl),
+            tp: parseFloat(trade.tp),
+            rr: trade.rr,
+            confidence: trade.confidence,
+            notes: trade.notes,
+            loggedAt: Date.now(),
+            status: 'pending',
+            resolvedAt: null,
+            rrAchieved: null
+        });
+        saveJournal(journal);
+    }
+
+    function summarizeJournal(journal) {
+        const resolved = journal.filter(e => e.status === 'win' || e.status === 'loss' || e.status === 'expired');
+        const wins = journal.filter(e => e.status === 'win').length;
+        const losses = journal.filter(e => e.status === 'loss').length;
+        const expired = journal.filter(e => e.status === 'expired').length;
+        const pending = journal.filter(e => e.status === 'pending').length;
+        const decided = wins + losses;
+        const totalR = resolved.reduce((s, e) => s + (e.rrAchieved || 0), 0);
+        return {
+            total: journal.length, wins, losses, expired, pending,
+            winRate: decided > 0 ? (wins / decided) * 100 : null,
+            avgR: resolved.length > 0 ? totalR / resolved.length : null,
+            totalR
+        };
+    }
+
+    function renderJournal() {
+        const journal = loadJournal();
+        const stats = summarizeJournal(journal);
+        const summaryEl = document.getElementById('journalSummary');
+        summaryEl.innerHTML = journal.length === 0
+            ? '<div class="row muted">No trades logged yet - trades from live runs are saved here automatically.</div>'
+            : `
+                <div class="row"><strong>${stats.total} logged</strong> | ${stats.pending} pending | ${stats.wins}W / ${stats.losses}L / ${stats.expired} expired</div>
+                <div class="row">Win rate (decided): ${stats.winRate !== null ? stats.winRate.toFixed(1) + '%' : 'n/a'} | Avg R (resolved): ${stats.avgR !== null ? stats.avgR.toFixed(2) : 'n/a'} | Total R: ${stats.totalR.toFixed(2)}</div>
+            `;
+
+        const listEl = document.getElementById('journalList');
+        if (journal.length === 0) { listEl.innerHTML = ''; return; }
+        listEl.innerHTML = journal.slice().reverse().slice(0, 100).map(e => {
+            const cls = e.status === 'win' ? 'success' : e.status === 'loss' ? 'error' : e.status === 'pending' ? '' : 'muted';
+            const rrText = e.rrAchieved !== null ? `${e.rrAchieved > 0 ? '+' : ''}${e.rrAchieved.toFixed(2)}R` : '-';
+            return `<div class="row"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</div>`;
+        }).join('');
+    }
+
+    async function checkJournalOutcomes() {
+        const btn = document.getElementById('journalCheckBtn');
+        const logEl = document.getElementById('journalLog');
+        logEl.innerHTML = '';
+        const jlog = (msg, cls) => {
+            logEl.innerHTML += cls ? `<span class="${cls}">${msg}</span>\n` : `${msg}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        };
+
+        const journal = loadJournal();
+        const pending = journal.filter(e => e.status === 'pending');
+        if (pending.length === 0) { jlog('No pending trades to check.'); return; }
+
+        btn.disabled = true;
+        const controller = new AbortController();
+        try {
+            jlog(`Checking ${pending.length} pending trade(s) against actual price history since they were logged...`);
+            for (const entry of pending) {
+                const symbol = entry.symbol.endsWith('USDT') ? entry.symbol : entry.symbol + 'USDT';
+                const msSince = Date.now() - entry.loggedAt;
+                const barsSince = Math.min(1000, Math.ceil(msSince / (5 * 60 * 1000)) + 2);
+                if (barsSince < 1) { jlog(`${entry.symbol}: too recent to check yet.`); continue; }
+
+                const klines = await fetchKlines(symbol, '5m', barsSince, controller.signal, entry.loggedAt);
+                if (!klines || klines.length === 0) {
+                    jlog(`${entry.symbol}: no candle data since it was logged - skipping.`, 'error');
+                    continue;
                 }
-                
-                const topCryptosRaw = await marketsRes.json();
-                if (!Array.isArray(topCryptosRaw)) {
-                    output.innerHTML += `<span class="error">Invalid API response (not an array): ${JSON.stringify(topCryptosRaw)}</span>\n`;
-                    return;
-                }
-                const topCryptos = topCryptosRaw;
 
-                // Filter candidates: 10 bullish and 10 bearish to respect rate limits
-                const bullishCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h > 3).slice(0, 10);
-                const bearishCandidates = topCryptos.filter(coin => coin.price_change_percentage_24h < -3).slice(0, 10);
-                
-                output.innerHTML += `<span class="success">Found ${bullishCandidates.length} bullish candidates (>3% 24h) and ${bearishCandidates.length} bearish candidates (<-3% 24h).</span>\nAnalyzing each with Gemini AI for ICT confluence...\n\n`;
-
-                const validTrades = { longs: [], shorts: [] };
-
-                // Helper function to analyze a candidate
-                async function analyzeCandidate(coin, direction) {
-                    const id = coin.id;
-                    const symbol = coin.symbol.toUpperCase();
-                    const currentPrice = coin.current_price;
-                    const change24h = coin.price_change_percentage_24h.toFixed(2);
-
-                    let bias = 'Invalid';
-                    let entry = null, sl = null, tp = null, rr = 0;
-
-                    try {
-                        // Fetch 1-day 5min closes for LTF/MTF
-                        const from1d = Math.floor((Date.now() / 1000) - 86400);
-                        const toNow = Math.floor(Date.now() / 1000);
-                        const chart1dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
-                        const chart1dParams = new URLSearchParams({ vs_currency: 'usd', from: from1d, to: toNow });
-                        const chart1dRes = await fetch(`${chart1dUrl}?${chart1dParams}`, { headers: HEADERS });
-                        
-                        if (!chart1dRes.ok) {
-                            return { success: false, msg: ` (Chart fetch failed: ${chart1dRes.status} - Skipping ${symbol})` };
-                        }
-                        
-                        const chart1dData = await chart1dRes.json();
-                        const prices1d = chart1dData.prices || [];
-                        const closes1d = prices1d.map(p => p[1]);
-
-                        if (closes1d.length < 20) {
-                            return { success: false, msg: ` (Low data: Skipping ${symbol})` };
-                        }
-
-                        // Fetch 7-day hourly for HTF H1
-                        const from7d = Math.floor((Date.now() / 1000) - 7 * 86400);
-                        const chart7dUrl = `${BASE_URL}/coins/${id}/market_chart/range`;
-                        const chart7dParams = new URLSearchParams({ vs_currency: 'usd', from: from7d, to: toNow });
-                        const chart7dRes = await fetch(`${chart7dUrl}?${chart7dParams}`, { headers: HEADERS });
-                        
-                        if (!chart7dRes.ok) {
-                            return { success: false, msg: ` (7D chart failed: Skipping ${symbol})` };
-                        }
-                        
-                        const chart7dData = await chart7dRes.json();
-                        const prices7d = chart7dData.prices || [];
-                        const closes7d = prices7d.map(p => p[1]);
-
-                        if (closes7d.length < 24) {
-                            return { success: false, msg: ` (Low 7D data: Skipping ${symbol})` };
-                        }
-
-                        // Prepare data for Gemini
-                        const recent1d = closes1d.slice(-50).join(', ');
-                        const recent7d = closes7d.slice(-50).join(', ');
-                        
-                        let prompt = '';
-                        if (direction === 'bullish') {
-                            prompt = `You are an expert ICT (Inner Circle Trader) sniper for crypto longs. Analyze for high-probability long setup.
-
-Symbol: ${symbol}
-Current Price: $${currentPrice.toFixed(4)}
-24h Change: +${change24h}%
-Session: ${timeNote}
-
-Price Data:
-- Recent 1-day 5min closes (last 50): [${recent1d}]
-- Recent 7-day hourly closes (last 50): [${recent7d}]
-
-Rules for valid setup:
-- HTF (H1/7d): Bullish structure (higher highs & higher lows).
-- MTF (M15 approx): Price above 20-period MA.
-- LTF (M5): In 61.8% Fibonacci OTE retracement of recent upswing, during kill zone or Asian bias.
-- Overall: Positive momentum, confluence across timeframes.
-
-If valid, suggest:
-- Bias: 'Bullish (HTF HH/HL BOS, MTF MA confluence, LTF OTE retrace)'
-- Entry: Near current price
-- SL: ~0.5% below recent swing low or structure
-- TP: 3:1 RR from entry/SL
-- RR: 3
-- Notes: Include session context
-
-Else: Bias 'Invalid'
-
-Respond ONLY with valid JSON (no extra text):
-{
-  "bias": "Bullish ... or Invalid",
-  "entry": number or null,
-  "sl": number or null,
-  "tp": number or null,
-  "rr": number or 0,
-  "notes": "string"
-}`;
-                        } else { // bearish
-                            prompt = `You are an expert ICT sniper for crypto shorts. Analyze for high-probability short setup.
-
-Symbol: ${symbol}
-Current Price: $${currentPrice.toFixed(4)}
-24h Change: ${change24h}% (negative momentum)
-Session: ${timeNote}
-
-Price Data:
-- Recent 1-day 5min closes (last 50): [${recent1d}]
-- Recent 7-day hourly closes (last 50): [${recent7d}]
-
-Rules for valid setup:
-- HTF (H1/7d): Bearish structure (lower highs & lower lows).
-- MTF (M15 approx): Price below 20-period MA.
-- LTF (M5): In 61.8% Fibonacci OTE retracement of recent downswing, during kill zone or Asian bias.
-- Overall: Negative momentum, confluence across timeframes.
-
-If valid, suggest:
-- Bias: 'Bearish (HTF LH/LL BOS, MTF MA confluence, LTF OTE retrace)'
-- Entry: Near current price
-- SL: ~0.5% above recent swing high or structure
-- TP: 3:1 RR from entry/SL (downward)
-- RR: 3
-- Notes: Include session context
-
-Else: Bias 'Invalid'
-
-Respond ONLY with valid JSON (no extra text):
-{
-  "bias": "Bearish ... or Invalid",
-  "entry": number or null,
-  "sl": number or null,
-  "tp": number or null,
-  "rr": number or 0,
-  "notes": "string"
-}`;
-                        }
-
-                        const analysis = await callGemini(prompt);
-
-                        if (analysis.bias && analysis.bias !== 'Invalid' && analysis.entry && analysis.sl && analysis.tp) {
-                            bias = analysis.bias;
-                            entry = analysis.entry;
-                            sl = analysis.sl;
-                            tp = analysis.tp;
-                            rr = analysis.rr || 3;
-
-                            // Lot size: Position USD = risk $1 / (SL dist %) 
-                            const slDistance = Math.abs(entry - sl);
-                            const riskPct = slDistance / entry;
-                            const positionUSD = 1 / riskPct;
-                            const lotSize = (positionUSD / entry).toFixed(4); // In crypto units
-
-                            return {
-                                success: true,
-                                trade: {
-                                    name: coin.name,
-                                    symbol,
-                                    entry: entry.toFixed(4),
-                                    sl: sl.toFixed(4),
-                                    tp: tp.toFixed(4),
-                                    lotSize,
-                                    rr,
-                                    notes: `${analysis.notes} | 24h: ${change24h}% | AI-Powered ICT Analysis`,
-                                    direction: direction === 'bullish' ? 'Long' : 'Short'
-                                }
-                            };
-                        }
-                    } catch (coinError) {
-                        return { success: false, msg: ` (Coin error for ${symbol}: ${coinError.message} - Skipping)` };
+                const direction = entry.direction === 'Long' ? 'bullish' : 'bearish';
+                let resolved = false;
+                for (const bar of klines) {
+                    if (direction === 'bullish') {
+                        if (bar.low <= entry.sl) { entry.status = 'loss'; entry.rrAchieved = -1; resolved = true; }
+                        else if (bar.high >= entry.tp) { entry.status = 'win'; entry.rrAchieved = entry.rr; resolved = true; }
+                    } else {
+                        if (bar.high >= entry.sl) { entry.status = 'loss'; entry.rrAchieved = -1; resolved = true; }
+                        else if (bar.low <= entry.tp) { entry.status = 'win'; entry.rrAchieved = entry.rr; resolved = true; }
                     }
-
-                    return { success: false, msg: ' done.\n' };
+                    if (resolved) { entry.resolvedAt = bar.closeTime; break; }
                 }
 
-                // Analyze bullish candidates
-                output.innerHTML += '--- Bullish Analysis ---\n';
-                for (let i = 0; i < bullishCandidates.length; i++) {
-                    const coin = bullishCandidates[i];
-                    const symbol = coin.symbol.toUpperCase();
-                    output.innerHTML += `Checking ${symbol} (bullish)...`;
-                    
-                    const result = await analyzeCandidate(coin, 'bullish');
-                    output.innerHTML += result.msg || '';
-                    
-                    if (result.success) {
-                        validTrades.longs.push(result.trade);
-                    }
-                    
-                    // Tiny delay to respect rate limits
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
-
-                // Analyze bearish candidates
-                output.innerHTML += '\n--- Bearish Analysis ---\n';
-                for (let i = 0; i < bearishCandidates.length; i++) {
-                    const coin = bearishCandidates[i];
-                    const symbol = coin.symbol.toUpperCase();
-                    output.innerHTML += `Checking ${symbol} (bearish)...`;
-                    
-                    const result = await analyzeCandidate(coin, 'bearish');
-                    output.innerHTML += result.msg || '';
-                    
-                    if (result.success) {
-                        validTrades.shorts.push(result.trade);
-                    }
-                    
-                    // Tiny delay to respect rate limits
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
-
-                output.innerHTML += '\n';
-
-                // Output summaries
-                output.innerHTML += '=== TIMEFRAME SUMMARIES (Global) ===\n';
-                output.innerHTML += 'HTF (H1): Bullish bias via HH/HL structure breaks (BOS). Bearish via LH/LL. Liquidity targeted above/below recent highs/lows.\n';
-                output.innerHTML += 'MTF (M15): Confluence if price >/< 20-MA, aligning with HTF.\n';
-                output.innerHTML += 'LTF (M1): Precision at 61.8% Fib OTE on recent displacement.\n\n';
-
-                // Output longs
-                const totalLongs = validTrades.longs.length;
-                if (totalLongs === 0) {
-                    output.innerHTML += '<span class="error">No Valid Long Trades: No Bullish Setup or Risk/Reward Violated.</span>\n';
+                if (resolved) {
+                    jlog(`${entry.symbol} ${entry.direction}: ${entry.status.toUpperCase()} (${entry.rrAchieved > 0 ? '+' : ''}${entry.rrAchieved.toFixed(2)}R)`, entry.status === 'win' ? 'success' : 'error');
+                } else if (msSince > JOURNAL_MAX_HOLD_MS) {
+                    const lastClose = klines[klines.length - 1].close;
+                    const risk = Math.abs(entry.entry - entry.sl);
+                    entry.rrAchieved = direction === 'bullish' ? (lastClose - entry.entry) / risk : (entry.entry - lastClose) / risk;
+                    entry.status = 'expired';
+                    entry.resolvedAt = Date.now();
+                    jlog(`${entry.symbol} ${entry.direction}: EXPIRED after ${Math.round(JOURNAL_MAX_HOLD_MS / 3600000)}h untouched, marked to market (${entry.rrAchieved > 0 ? '+' : ''}${entry.rrAchieved.toFixed(2)}R)`);
                 } else {
-                    output.innerHTML += `<span class="success">=== Valid Sniper Long Trade Plans (${totalLongs} found via Gemini AI) ===</span>\n`;
-                    validTrades.longs.forEach((trade, idx) => {
-                        output.innerHTML += `<span class="long">${idx+1}. ${trade.name} (${trade.symbol})</span>\n`;
-                        output.innerHTML += `Valid Sniper Trade Plan: ${trade.direction} | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
-                    });
+                    jlog(`${entry.symbol} ${entry.direction}: still pending - no TP/SL touch yet.`);
                 }
+                await sleep(250);
+            }
+            saveJournal(journal);
+            jlog('\nDone.', 'success');
+        } catch (e) {
+            jlog(`Error checking outcomes: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+            renderJournal();
+        }
+    }
 
-                // Output shorts
-                const totalShorts = validTrades.shorts.length;
-                if (totalShorts === 0) {
-                    output.innerHTML += '<span class="error">No Valid Short Trades: No Bearish Setup or Risk/Reward Violated.</span>\n';
-                } else {
-                    output.innerHTML += `<span class="success">=== Valid Sniper Short Trade Plans (${totalShorts} found via Gemini AI) ===</span>\n`;
-                    validTrades.shorts.forEach((trade, idx) => {
-                        output.innerHTML += `<span class="short">${idx+1}. ${trade.name} (${trade.symbol})</span>\n`;
-                        output.innerHTML += `Valid Sniper Trade Plan: ${trade.direction} | Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | Lot Size: ${trade.lotSize} ${trade.symbol} | RR: ${trade.rr}:1 | Notes: ${trade.notes}.\n\n`;
-                    });
-                }
+    function clearJournal() {
+        if (!confirm('Clear all journaled trades? This cannot be undone.')) return;
+        localStorage.removeItem(JOURNAL_KEY);
+        renderJournal();
+    }
 
-                if (totalLongs === 0 && totalShorts === 0) {
-                    output.innerHTML += 'Tip: Market might be flat—try lowering threshold to >1% / <-1% in code (lines ~120-121). Check Gemini prompt for refinements.\n';
-                }
+    function exportJournalCSV() {
+        const journal = loadJournal();
+        if (journal.length === 0) return;
+        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,notes\n';
+        const rows = journal.map(e => [
+            e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
+            e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
+            e.rrAchieved !== null ? e.rrAchieved.toFixed(4) : '',
+            `"${(e.notes || '').replace(/"/g, '""')}"`
+        ].join(',')).join('\n');
+        const blob = new Blob([header + rows], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `ict_journal_${Date.now()}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
 
-                output.innerHTML += '\nPitfalls: Avoid overtrading outside kill zones; wait for structure confirmation. Study ICT: Focus on PO3 cycles, FVGs, OBs for refinement. Gemini analysis is AI-assisted—verify manually.\n';
-
-            } catch (error) {
-                output.innerHTML += `<span class="error">Global Error: ${error.message} (Check connection or API key).</span>\n`;
+    // Minimal CSV line parser - handles quoted fields containing commas and
+    // escaped double-quotes (which is all exportJournalCSV ever produces,
+    // but written defensively in case the file was hand-edited).
+    function parseCSVLine(line) {
+        const fields = [];
+        let cur = '', inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+            const c = line[i];
+            if (inQuotes) {
+                if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+                else if (c === '"') { inQuotes = false; }
+                else { cur += c; }
+            } else {
+                if (c === '"') inQuotes = true;
+                else if (c === ',') { fields.push(cur); cur = ''; }
+                else cur += c;
             }
         }
-    </script>
+        fields.push(cur);
+        return fields;
+    }
+
+    // Imports a previously exported journal CSV (from this device or
+    // another one) and merges it into the local journal. Entries are
+    // deduped by id where available, falling back to a symbol+loggedAt+entry
+    // match for older exports that predate the id column. Existing local
+    // entries are NOT overwritten by an import - if both a local pending
+    // entry and an imported resolved entry share an id, the resolved one
+    // wins, since "checked outcome" is strictly more information than
+    // "still pending."
+    function importJournalCSV(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const text = reader.result;
+                const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+                if (lines.length < 2) { alert('CSV has no data rows.'); return; }
+                const header = parseCSVLine(lines[0]).map(h => h.trim());
+                const hasId = header[0] === 'id';
+
+                const imported = lines.slice(1).map(line => {
+                    const f = parseCSVLine(line);
+                    const get = (name) => f[header.indexOf(name)];
+                    const loggedAtStr = get('loggedAt');
+                    const resolvedAtStr = get('resolvedAt');
+                    const rrAchievedStr = get('rrAchieved');
+                    return {
+                        id: hasId && get('id') ? get('id') : `${get('symbol')}-${Date.parse(loggedAtStr)}-${get('entry')}`,
+                        symbol: get('symbol'),
+                        direction: get('direction'),
+                        entry: parseFloat(get('entry')),
+                        sl: parseFloat(get('sl')),
+                        tp: parseFloat(get('tp')),
+                        rr: parseFloat(get('rr')),
+                        confidence: get('confidence'),
+                        notes: get('notes') || '',
+                        loggedAt: Date.parse(loggedAtStr) || Date.now(),
+                        status: get('status') || 'pending',
+                        resolvedAt: resolvedAtStr ? Date.parse(resolvedAtStr) : null,
+                        rrAchieved: rrAchievedStr !== '' && rrAchievedStr !== undefined ? parseFloat(rrAchievedStr) : null
+                    };
+                }).filter(e => e.symbol && !isNaN(e.entry));
+
+                const existing = loadJournal();
+                const byId = new Map(existing.map(e => [e.id, e]));
+                let added = 0, updated = 0;
+
+                imported.forEach(imp => {
+                    const match = byId.get(imp.id);
+                    if (!match) {
+                        byId.set(imp.id, imp);
+                        added++;
+                    } else if (match.status === 'pending' && imp.status !== 'pending') {
+                        // Imported copy has a resolved outcome the local copy doesn't - take it.
+                        byId.set(imp.id, imp);
+                        updated++;
+                    }
+                });
+
+                const merged = Array.from(byId.values()).sort((a, b) => a.loggedAt - b.loggedAt);
+                saveJournal(merged);
+                renderJournal();
+                alert(`Import complete: ${added} new trade(s) added, ${updated} updated with resolved outcomes.`);
+            } catch (e) {
+                alert(`Could not import CSV: ${e.message}`);
+            } finally {
+                event.target.value = ''; // allow re-selecting the same file later
+            }
+        };
+        reader.readAsText(file);
+    }
+
+    // ------------------------------------------------------------------
+    // Prompt construction - Gemini only judges context/session quality now;
+    // it does not compute or invent entry/SL/TP/RR (Phase 2.3).
+    // ------------------------------------------------------------------
+    function buildPrompt(coin, direction, currentPrice, filterResult, sessionInfo, change24h) {
+        const dirLabel = direction === 'bullish' ? 'long' : 'short';
+        const structureLabel = direction === 'bullish' ? 'HH/HL (higher highs, higher lows)' : 'LH/LL (lower highs, lower lows)';
+        return `You are an expert ICT (Inner Circle Trader) analyst reviewing a pre-screened ${dirLabel} candidate.
+The following technical facts have already been computed and verified in code - treat them as ground truth, do not recompute them:
+
+Symbol: ${coin.symbol.toUpperCase()}
+Current Price: $${currentPrice}
+24h Change: ${change24h}%
+20-period MA (1h): $${filterResult.sma.toFixed(6)} (price is ${direction === 'bullish' ? 'above' : 'below'} it)
+HTF structure: confirmed ${structureLabel} over the recent lookback window
+Recent swing high: $${filterResult.swing.high}
+Recent swing low: $${filterResult.swing.low}
+Price is currently inside the 61.8%-78.6% Fibonacci OTE retracement zone of that swing
+Session: ${sessionInfo.summary}
+
+Your job is ONLY to judge context and confidence - not to invent price levels:
+- Does the session timing support this setup (kill zone or Asian bias)?
+- Does anything about the price action narrative undermine the technical confluence above?
+- Give a confidence rating and brief reasoning.
+
+Respond ONLY with valid JSON, no extra text:
+{
+  "valid": true or false,
+  "confidence": "high", "medium", or "low",
+  "notes": "one or two sentence rationale, including session context"
+}`;
+    }
+
+    function validateGeminiAnalysis(analysis) {
+        if (typeof analysis.valid !== 'boolean') return 'Missing or invalid "valid" field';
+        if (analysis.valid && !['high', 'medium', 'low'].includes(analysis.confidence)) return 'Missing or invalid "confidence" field';
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Rendering
+    // ------------------------------------------------------------------
+    let lastValidTrades = { longs: [], shorts: [] };
+
+    function renderTradeCard(trade) {
+        const cards = document.getElementById('cards');
+        const cls = trade.direction === 'Long' ? 'long' : 'short';
+        const div = document.createElement('div');
+        div.className = `card ${cls}`;
+        div.innerHTML = `
+            <h3>${trade.name} (${trade.symbol}) - ${trade.direction}</h3>
+            <div class="row">Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | RR: ${trade.rr}:1</div>
+            <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
+            <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
+            <div class="row muted">${trade.notes}</div>
+            <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
+        `;
+        cards.appendChild(div);
+    }
+
+    function tradePlanText() {
+        const lines = ['=== ICT Sniper Trade Plan ==='];
+        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
+        if (all.length === 0) return 'No valid trades found this run.';
+        all.forEach((t, i) => {
+            lines.push(`${i + 1}. ${t.direction} ${t.symbol} | Entry: $${t.entry} | SL: $${t.sl} | TP: $${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | ${t.notes}`);
+        });
+        return lines.join('\n');
+    }
+
+    function copyTradePlan() {
+        navigator.clipboard.writeText(tradePlanText()).then(() => {
+            log('Trade plan copied to clipboard.', 'success');
+        }).catch(() => {
+            log('Could not copy automatically - select and copy the log manually.', 'error');
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Per-candidate analysis
+    // ------------------------------------------------------------------
+    async function analyzeCandidate(coin, direction, config, sessionInfo, apiKey, signal) {
+        const symbol = coin.symbol.toUpperCase();
+        const change24h = coin.price_change_percentage_24h.toFixed(2);
+
+        if (Math.abs(coin.price_change_percentage_24h) > 50) {
+            return { success: false, reason: 'Extreme 24h volatility (>50%) - likely data anomaly, skipped as a precaution' };
+        }
+
+        const candles = await fetchCoinCandles(coin, signal);
+        if (!candles) return { success: false, reason: 'No matching Binance USDT pair or candle fetch failed' };
+
+        if (candles.closesHTF.length < 24) return { success: false, reason: 'Insufficient 1h candle history' };
+        if (candles.closesLTF.length < 20) return { success: false, reason: 'Insufficient 5m candle history' };
+
+        // Hard stop on stale data - do NOT proceed to render a card off a
+        // feed that might be frozen/cached. This is the fix for "nothing
+        // in the app would tell you the signal is bad": we now check, and
+        // we refuse to produce a signal rather than silently trusting it.
+        if (candles.dataQuality.stale) {
+            return {
+                success: false,
+                reason: `Stale data - skipped for safety (1h feed ${candles.dataQuality.htfAgeMinutes}m old, 5m feed ${candles.dataQuality.ltfAgeMinutes}m old)`
+            };
+        }
+
+        const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
+
+        const priceCheck = checkPriceConsistency(coin.current_price, currentPrice);
+        if (!priceCheck.consistent) {
+            return {
+                success: false,
+                reason: `CoinGecko/Binance price mismatch (${priceCheck.diffPct.toFixed(1)}%) - possible wrong pair or stale feed, skipped for safety`
+            };
+        }
+
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.closesLTF, currentPrice, direction);
+        if (!filterResult.pass) return { success: false, reason: filterResult.reason };
+
+        const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, config.targetRR);
+        if (!levels) return { success: false, reason: 'Computed risk distance was zero/invalid - skipped' };
+
+        const prompt = buildPrompt(coin, direction, currentPrice.toFixed(6), filterResult, sessionInfo, change24h);
+
+        let analysis;
+        try {
+            analysis = await callGeminiJSON(prompt, apiKey, signal);
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            return { success: false, reason: `Gemini error: ${e.message}` };
+        }
+
+        const validationError = validateGeminiAnalysis(analysis);
+        if (validationError) return { success: false, reason: `Gemini response invalid: ${validationError}` };
+        if (!analysis.valid) return { success: false, reason: `Gemini: ${analysis.notes || 'context did not support setup'}` };
+
+        const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
+
+        return {
+            success: true,
+            trade: {
+                name: coin.name,
+                symbol,
+                entry: levels.entry.toFixed(6),
+                sl: levels.sl.toFixed(6),
+                tp: levels.tp.toFixed(6),
+                rr: levels.rr,
+                units: sizing.units.toFixed(4),
+                positionUSD: sizing.positionUSD.toFixed(2),
+                riskAmount: sizing.riskAmount.toFixed(2),
+                confidence: analysis.confidence,
+                notes: `${analysis.notes} | 24h: ${change24h}%`,
+                direction: direction === 'bullish' ? 'Long' : 'Short',
+                dataAgeMinutes: Math.max(candles.dataQuality.htfAgeMinutes, candles.dataQuality.ltfAgeMinutes)
+            }
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Main run
+    // ------------------------------------------------------------------
+    async function runAnalysis() {
+        if (isRunning) return;
+
+        const apiKey = document.getElementById('geminiKey').value.trim();
+        document.getElementById('log').innerHTML = '';
+        document.getElementById('cards').innerHTML = '';
+        document.getElementById('copyBtn').style.display = 'none';
+        lastValidTrades = { longs: [], shorts: [] };
+
+        if (!apiKey) {
+            log('Please enter your Gemini API key!', 'error');
+            return;
+        }
+
+        saveConfig();
+        const config = getConfig();
+
+        isRunning = true;
+        currentController = new AbortController();
+        document.getElementById('runBtn').disabled = true;
+        document.getElementById('cancelBtn').style.display = 'block';
+
+        try {
+            log('Validating Gemini API key...');
+            const keyOk = await testGeminiKey(apiKey, currentController.signal);
+            if (!keyOk) {
+                log('Gemini API key appears invalid or has no quota. Stopping before using any CoinGecko calls.', 'error');
+                return;
+            }
+            log('Gemini key OK.', 'success');
+
+            const sessionInfo = getSessionInfo(config.displayTimezone);
+            log(sessionInfo.summary);
+
+            log('Fetching top 50 markets from CoinGecko...');
+            const topCryptos = await fetchTopMarkets(currentController.signal);
+
+            const bullishCandidates = topCryptos.filter(c => c.price_change_percentage_24h > config.momentumThreshold).slice(0, config.candidateCount);
+            const bearishCandidates = topCryptos.filter(c => c.price_change_percentage_24h < -config.momentumThreshold).slice(0, config.candidateCount);
+            log(`Found ${bullishCandidates.length} bullish and ${bearishCandidates.length} bearish candidates (threshold +/-${config.momentumThreshold}%).`, 'success');
+            log('Running local MA/structure/Fibonacci filter before any Gemini calls...\n');
+
+            const allCandidates = [
+                ...bullishCandidates.map(c => ({ coin: c, direction: 'bullish' })),
+                ...bearishCandidates.map(c => ({ coin: c, direction: 'bearish' }))
+            ];
+            const total = allCandidates.length;
+            let geminiCallCount = 0;
+
+            for (let i = 0; i < allCandidates.length; i++) {
+                if (currentController.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+                const { coin, direction } = allCandidates[i];
+                const symbol = coin.symbol.toUpperCase();
+                setProgress(i, total, `Scanning ${i + 1}/${total}: ${symbol}`);
+
+                const result = await analyzeCandidate(coin, direction, config, sessionInfo, apiKey, currentController.signal);
+                setProgress(i + 1, total, `Scanned ${i + 1}/${total}: ${symbol}`);
+
+                if (result.success) {
+                    if (result.trade.direction === 'Long') lastValidTrades.longs.push(result.trade);
+                    else lastValidTrades.shorts.push(result.trade);
+                    renderTradeCard(result.trade);
+                    logTradeToJournal(result.trade);
+                    log(`${symbol} (${direction}): VALID setup found - logged to journal.`, 'success');
+                } else {
+                    log(`${symbol} (${direction}): skipped - ${result.reason}`);
+                }
+
+                await sleep(300); // small courtesy delay between coins
+            }
+
+            setProgress(total, total, 'Done');
+            log('\n=== Run complete ===');
+            renderJournal();
+            log(`Long setups: ${lastValidTrades.longs.length} | Short setups: ${lastValidTrades.shorts.length}`);
+            if (lastValidTrades.longs.length === 0 && lastValidTrades.shorts.length === 0) {
+                log('No valid trades this run. Try lowering the momentum threshold in Settings, or re-run during a kill zone.');
+            } else {
+                document.getElementById('copyBtn').style.display = 'block';
+            }
+            log('\nReminder: verify every setup manually before acting. AI output is context, not certainty.', 'error');
+
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                log('\nRun cancelled by user.', 'error');
+            } else {
+                log(`\nGlobal Error: ${error.message}`, 'error');
+            }
+        } finally {
+            isRunning = false;
+            currentController = null;
+            document.getElementById('runBtn').disabled = false;
+            document.getElementById('cancelBtn').style.display = 'none';
+        }
+    }
+
+    function cancelAnalysis() {
+        if (currentController) currentController.abort();
+    }
+
+    loadConfig();
+    renderJournal();
+</script>
 </body>
-    </html>
+</html>
