@@ -1841,4 +1841,57 @@ Respond ONLY with valid JSON, no extra text:
                     log(`${symbol} (${direction}): skipped - ${result.reason}`);
                     if (/\b429\b|quota/i.test(result.reason)) {
                         log(`\nGemini quota exceeded - stopping the scan here instead of retrying the same error on every remaining candidate (${total - i - 1} left unscanned).`, 'error');
-                        log('This is a Google API-side limit, not an app bug. Fixes: lower "Gemini requests/minute" in Settings, reduce Candidates per side, wait a bi
+                        log('This is a Google API-side limit, not an app bug. Fixes: lower "Gemini requests/minute" in Settings, reduce Candidates per side, wait a bit for the quota window to reset, or check your plan/billing at https://ai.google.dev/gemini-api/docs/rate-limits', 'error');
+                        break;
+                    }
+                }
+
+                await sleep(300); // small courtesy delay between coins
+            }
+
+            setProgress(total, total, 'Done');
+            log('\n=== Run complete ===');
+            renderJournal();
+            renderCircuitBreakerStatus();
+            log(`Long setups: ${lastValidTrades.longs.length} | Short setups: ${lastValidTrades.shorts.length}`);
+            if (lastValidTrades.longs.length === 0 && lastValidTrades.shorts.length === 0) {
+                log('No valid trades this run. Try lowering the momentum threshold in Settings, or re-run during a kill zone.');
+            } else {
+                rankAndRerenderCards();
+                if (lastValidTrades.longs.length + lastValidTrades.shorts.length > 1) {
+                    log('Multiple setups triggered this run - cards above are ranked by volume displacement (strongest institutional push first).', 'success');
+                }
+                document.getElementById('copyBtn').style.display = 'block';
+            }
+            log('\nReminder: verify every setup manually before acting. AI output is context, not certainty.', 'error');
+
+            const nextRun = suggestNextRunTime(sessionInfo, config.displayTimezone);
+            log(`\nNext run suggestion: ${nextRun.message}`, 'success');
+            const suggestionEl = document.getElementById('nextRunSuggestion');
+            suggestionEl.style.display = 'block';
+            suggestionEl.innerHTML = `<strong>Next run suggestion:</strong> ${nextRun.message}`;
+
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                log('\nRun cancelled by user.', 'error');
+            } else {
+                log(`\nGlobal Error: ${error.message}`, 'error');
+            }
+        } finally {
+            isRunning = false;
+            currentController = null;
+            document.getElementById('runBtn').disabled = false;
+            document.getElementById('cancelBtn').style.display = 'none';
+        }
+    }
+
+    function cancelAnalysis() {
+        if (currentController) currentController.abort();
+    }
+
+    loadConfig();
+    renderJournal();
+    renderCircuitBreakerStatus();
+</script>
+</body>
+</html>
