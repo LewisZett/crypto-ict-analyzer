@@ -90,6 +90,16 @@
             <input type="number" id="candidateCount" value="10" min="1" max="25">
         </div>
         <div>
+            <label for="geminiRpm">Gemini requests/minute (free tier: ~8-10)</label>
+            <input type="number" id="geminiRpm" value="8" min="1" max="60">
+        </div>
+        <div>
+            <label for="strictConfluence" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
+                <input type="checkbox" id="strictConfluence" checked style="width:auto; margin:0;">
+                Strict ICT confluence (require liquidity sweep + FVG)
+            </label>
+        </div>
+        <div>
             <label for="displayTimezone">Display Timezone</label>
             <select id="displayTimezone">
                 <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
@@ -142,14 +152,16 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'displayTimezone'];
+    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'displayTimezone'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
             const saved = localStorage.getItem('ictSniper_' + key);
             if (saved !== null) {
                 const el = document.getElementById(key);
-                if (el) el.value = saved;
+                if (!el) return;
+                if (el.type === 'checkbox') el.checked = saved === 'true';
+                else el.value = saved;
             }
         });
     }
@@ -157,7 +169,8 @@
     function saveConfig() {
         CONFIG_KEYS.forEach(key => {
             const el = document.getElementById(key);
-            if (el) localStorage.setItem('ictSniper_' + key, el.value);
+            if (!el) return;
+            localStorage.setItem('ictSniper_' + key, el.type === 'checkbox' ? el.checked : el.value);
         });
     }
 
@@ -168,6 +181,8 @@
             momentumThreshold: parseFloat(document.getElementById('momentumThreshold').value) || 3,
             targetRR: parseFloat(document.getElementById('targetRR').value) || 3,
             candidateCount: Math.max(1, Math.min(25, parseInt(document.getElementById('candidateCount').value) || 10)),
+            geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
+            strictConfluence: document.getElementById('strictConfluence').checked,
             displayTimezone: document.getElementById('displayTimezone').value
         };
     }
@@ -180,6 +195,25 @@
 
     let isRunning = false;
     let currentController = null;
+
+    // ------------------------------------------------------------------
+    // Gemini pacing limiter. Free-tier Gemini keys are typically capped at
+    // a small requests-per-minute quota. Without pacing, this app can burn
+    // through that quota in seconds (one context call + one news call per
+    // valid candidate, back-to-back), which is what a 429 "quota exceeded"
+    // means. currentGeminiRpm is set from Settings at the start of each run;
+    // every Gemini call waits here first so calls stay spaced out instead
+    // of firing as fast as the loop can go.
+    // ------------------------------------------------------------------
+    let currentGeminiRpm = 8;
+    let lastGeminiCallAt = 0;
+
+    async function throttleGemini() {
+        const minGapMs = 60000 / currentGeminiRpm;
+        const wait = lastGeminiCallAt + minGapMs - Date.now();
+        if (wait > 0) await sleep(wait);
+        lastGeminiCallAt = Date.now();
+    }
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -232,6 +266,7 @@
     // Gemini
     // ------------------------------------------------------------------
     async function callGeminiRaw(prompt, apiKey, signal) {
+        await throttleGemini();
         const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
         const body = { contents: [{ parts: [{ text: prompt }] }] };
         const res = await fetchWithRetry(url, {
@@ -288,6 +323,7 @@
     // found - that's what gets shown to the user to verify independently.
     // ------------------------------------------------------------------
     async function callGeminiWithSearch(prompt, apiKey, signal) {
+        await throttleGemini();
         const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
         const body = {
             contents: [{ parts: [{ text: prompt }] }],
@@ -477,7 +513,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // needs heavy participation behind it, not just a price wiggle. Returns
     // { ok, ratio } - ratio is also surfaced to the caller so it can be used
     // later to RANK multiple simultaneous candidates by how much real
-    // volume is behind each one (see rankCandidatesByVolume).
+    // volume is behind each one.
     function checkVolumeDisplacement(volumesLTF) {
         if (!volumesLTF || volumesLTF.length < 20) return { ok: true, ratio: null }; // not enough data - don't block on it
         const recentVolume = volumesLTF[volumesLTF.length - 1];
@@ -487,9 +523,99 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { ok: ratio >= VOLUME_DISPLACEMENT_RATIO, ratio };
     }
 
-    // Hard local filter. Returns { pass, reason, sma, swing, volumeRatio } -
-    // only coins that pass this trigger a Gemini call at all (Phase 2.2).
-    function passesLocalFilter(closesHTF, closesLTF, volumesLTF, currentPrice, direction) {
+    // ------------------------------------------------------------------
+    // Liquidity sweep detection. A real ICT reversal typically follows a
+    // stop hunt: price wicks beyond a prior swing point (grabbing resting
+    // stop-loss/breakout orders - "liquidity") and then rejects back
+    // through it. Without this, the filter only knows the pullback landed
+    // inside a Fibonacci band - not that the pullback shows evidence of
+    // being a deliberate hunt rather than a random retracement.
+    // Bullish setups look for a swept SWING LOW (sell-side liquidity) with
+    // a bar that wicked below it but closed back above it. Bearish is the
+    // mirror: a swept SWING HIGH (buy-side liquidity) with a rejection
+    // close back below it. Pivots are detected off actual high/low wicks,
+    // not closes, since a sweep is by definition a wick-only event.
+    // ------------------------------------------------------------------
+    function findFractalHighLowCandles(candles, wing = 2) {
+        const highs = [], lows = [];
+        for (let i = wing; i < candles.length - wing; i++) {
+            const left = candles.slice(i - wing, i);
+            const right = candles.slice(i + 1, i + 1 + wing);
+            const h = candles[i].high, l = candles[i].low;
+            const isHigh = left.every(c => c.high <= h) && right.every(c => c.high < h);
+            const isLow = left.every(c => c.low >= l) && right.every(c => c.low > l);
+            if (isHigh) highs.push({ index: i, price: h });
+            if (isLow) lows.push({ index: i, price: l });
+        }
+        return { highs, lows };
+    }
+
+    const SWEEP_LOOKBACK_BARS = 12; // how recent the sweep + reversal must be, in LTF (5m) bars
+
+    function detectLiquiditySweep(candlesLTF, direction, wing = 2) {
+        if (!candlesLTF || candlesLTF.length < wing * 2 + 5) return { swept: false, level: null };
+        const { highs, lows } = findFractalHighLowCandles(candlesLTF, wing);
+        const pivots = direction === 'bullish' ? lows : highs;
+        if (pivots.length < 2) return { swept: false, level: null };
+
+        // Reference = the most recent CONFIRMED pivot before the last
+        // couple of bars, so the sweep candle isn't being compared to
+        // itself. This is the "prior liquidity" resting below/above price.
+        const reference = pivots[pivots.length - 2];
+        const recentBars = candlesLTF.slice(-SWEEP_LOOKBACK_BARS);
+
+        for (const bar of recentBars) {
+            if (direction === 'bullish') {
+                if (bar.low < reference.price && bar.close > reference.price) {
+                    return { swept: true, level: reference.price };
+                }
+            } else {
+                if (bar.high > reference.price && bar.close < reference.price) {
+                    return { swept: true, level: reference.price };
+                }
+            }
+        }
+        return { swept: false, level: reference.price };
+    }
+
+    // ------------------------------------------------------------------
+    // Fair Value Gap (FVG) detection. A 3-candle imbalance where candle 1
+    // and candle 3 don't overlap, leaving a gap price often returns to
+    // "fill" before continuing. Requiring the OTE entry to also sit inside
+    // an FVG from the same directional leg is a second, independent piece
+    // of price-action confluence beyond "the retracement % happens to
+    // match" - both a Fibonacci level AND an imbalance agreeing on the
+    // same price is a much less common coincidence than either alone.
+    // ------------------------------------------------------------------
+    function findFVGs(candlesLTF, direction) {
+        const fvgs = [];
+        if (!candlesLTF || candlesLTF.length < 3) return fvgs;
+        for (let i = 2; i < candlesLTF.length; i++) {
+            const c1 = candlesLTF[i - 2], c3 = candlesLTF[i];
+            if (direction === 'bullish' && c1.high < c3.low) {
+                fvgs.push({ top: c3.low, bottom: c1.high, index: i });
+            } else if (direction === 'bearish' && c1.low > c3.high) {
+                fvgs.push({ top: c1.low, bottom: c3.high, index: i });
+            }
+        }
+        return fvgs;
+    }
+
+    function findFVGContainingPrice(price, fvgs) {
+        return fvgs.find(g => price >= g.bottom && price <= g.top) || null;
+    }
+
+    // Hard local filter. Returns { pass, reason, sma, swing, volumeRatio,
+    // sweep, fvgMatch } - only coins that pass this trigger a Gemini call
+    // at all (Phase 2.2). candlesLTF is the raw OHLCV array (not just
+    // closes) so sweep/FVG detection has real wick data to work with.
+    // When strictConfluence is true, a confirmed liquidity sweep AND an
+    // FVG match are both REQUIRED, not just reported - this is the
+    // highest-conviction, lowest-frequency mode of the filter.
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence) {
+        const closesLTF = candlesLTF.map(c => c.close);
+        const volumesLTF = candlesLTF.map(c => c.volume);
+
         const sma = calculateSMA(closesHTF, 20);
         if (sma === null) return { pass: false, reason: 'Insufficient HTF data for 20-period MA' };
 
@@ -510,7 +636,20 @@ After searching, respond with ONLY this JSON object and no other text before or 
             return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${VOLUME_DISPLACEMENT_RATIO}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
         }
 
-        return { pass: true, sma, swing, volumeRatio: volCheck.ratio };
+        const sweep = detectLiquiditySweep(candlesLTF, direction);
+        const fvgs = findFVGs(candlesLTF.slice(-60), direction);
+        const fvgMatch = findFVGContainingPrice(currentPrice, fvgs);
+
+        if (strictConfluence) {
+            if (!sweep.swept) {
+                return { pass: false, reason: 'No confirmed liquidity sweep of a prior swing point - this retracement looks organic, not a stop hunt' };
+            }
+            if (!fvgMatch) {
+                return { pass: false, reason: 'Price is not sitting inside an unmitigated Fair Value Gap from this leg' };
+            }
+        }
+
+        return { pass: true, sma, swing, volumeRatio: volCheck.ratio, sweep, fvgMatch };
     }
 
     // Fraction of the swing leg's total range used as the SL invalidation
@@ -694,6 +833,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             closesHTF: klines1h.map(k => k.close),
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
+            candlesLTF: klines5m,
             dataQuality: {
                 stale: htfStale.stale || ltfStale.stale,
                 htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
@@ -776,19 +916,18 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // Walks forward through LTF candles for one direction, only searching
     // for a new signal once any open position has resolved (no overlapping
     // positions in the same direction - keeps the trade count honest).
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
         while (i < ltfKlines.length) {
             const bar = ltfKlines[i];
             const closesHTFasOf = getHTFSliceAsOf(htfKlines, bar.closeTime, 168);
-            const closesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1).map(k => k.close);
-            const volumesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1).map(k => k.volume);
+            const candlesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1);
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, closesLTFasOf, volumesLTFasOf, currentPrice, direction);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence);
                 if (filterResult.pass) {
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
                     if (levels) {
@@ -866,10 +1005,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 return;
             }
             btLogFn(`Got ${klines1h.length} 1h candles (~${Math.round(klines1h.length / 24)} days) and ${klines5m.length} 5m candles (~${(klines5m.length * 5 / 60 / 24).toFixed(1)} days).`);
-            btLogFn('Replaying local filter logic bar-by-bar (no Gemini - this only tests the deterministic technical rules)...\n');
+            btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
             const allStats = summarizeBacktest([...longTrades, ...shortTrades]);
@@ -963,6 +1102,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
             currentPrice: trade.currentPrice !== undefined ? parseFloat(trade.currentPrice) : null,
             distancePct: trade.distancePct !== undefined ? trade.distancePct : null,
             volumeRatio: trade.volumeRatio !== undefined ? trade.volumeRatio : null,
+            sweepConfirmed: trade.sweepConfirmed !== undefined ? trade.sweepConfirmed : null,
+            sweepLevel: trade.sweepLevel !== undefined ? trade.sweepLevel : null,
+            fvgConfluence: trade.fvgConfluence !== undefined ? trade.fvgConfluence : null,
+            fvgRange: trade.fvgRange || null,
             loggedAt: Date.now(),
             status: 'pending',
             resolvedAt: null,
@@ -1011,6 +1154,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 ? `${e.orderType.toUpperCase()}${e.currentPrice !== null ? ` (price at signal: $${e.currentPrice})` : ''}`
                 : 'Not recorded for this entry.';
             const volText = (e.volumeRatio !== null && e.volumeRatio !== undefined) ? `${e.volumeRatio.toFixed(2)}x 20-bar avg` : 'n/a';
+            const confluenceText = (e.sweepConfirmed !== null && e.sweepConfirmed !== undefined)
+                ? `Sweep: ${e.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${e.fvgConfluence ? 'yes' : 'no'}`
+                : 'Not recorded for this entry.';
             return `
                 <details class="row" style="background:#fafafa; border-radius:4px; padding:4px 8px; margin-bottom:4px;">
                     <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
@@ -1018,6 +1164,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     <div class="row">Order type: ${orderText}</div>
                     <div class="row">Position: ${sizingText}</div>
                     <div class="row">Volume displacement at signal: ${volText}</div>
+                    <div class="row">ICT confluence: ${confluenceText}</div>
                     <div class="row">AI context read (unvalidated) at time of signal: ${e.confidence}</div>
                     <div class="row muted">${e.notes || 'No notes recorded.'}</div>
                     ${e.newsCheck ? renderNewsSection(e.newsCheck) : '<div class="row muted">News check: not recorded for this entry.</div>'}
@@ -1193,7 +1340,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,notes\n';
+        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,notes\n';
         const rows = journal.map(e => [
             e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
@@ -1202,6 +1349,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             e.riskAmount !== undefined ? e.riskAmount : '', e.dataAgeMinutes !== undefined ? e.dataAgeMinutes : '',
             e.orderType || '', e.currentPrice !== null && e.currentPrice !== undefined ? e.currentPrice : '',
             e.volumeRatio !== null && e.volumeRatio !== undefined ? e.volumeRatio.toFixed(4) : '',
+            e.sweepConfirmed === true ? 'true' : e.sweepConfirmed === false ? 'false' : '',
+            e.fvgConfluence === true ? 'true' : e.fvgConfluence === false ? 'false' : '',
             `"${(e.notes || '').replace(/"/g, '""')}"`
         ].join(',')).join('\n');
         const blob = new Blob([header + rows], { type: 'text/csv' });
@@ -1259,6 +1408,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         return v !== undefined && v !== '' ? parseFloat(v) : undefined;
                     };
                     const loggedAtStr = get('loggedAt');
+                    const boolOrNull = (name) => {
+                        const v = get(name);
+                        return v === 'true' ? true : v === 'false' ? false : null;
+                    };
                     return {
                         id: hasId && get('id') ? get('id') : `${get('symbol')}-${Date.parse(loggedAtStr)}-${get('entry')}`,
                         symbol: get('symbol'),
@@ -1276,6 +1429,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         orderType: get('orderType') || null,
                         currentPrice: numOrUndefined('currentPrice') ?? null,
                         volumeRatio: numOrUndefined('volumeRatio') ?? null,
+                        sweepConfirmed: boolOrNull('sweepConfirmed'),
+                        fvgConfluence: boolOrNull('fvgConfluence'),
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
                         // Force all imported entries to pending, with no resolved outcome.
                         status: 'pending',
@@ -1336,10 +1491,13 @@ HTF structure: confirmed ${structureLabel} over the recent lookback window
 Recent swing high: $${filterResult.swing.high}
 Recent swing low: $${filterResult.swing.low}
 Price is currently inside the 61.8%-78.6% Fibonacci OTE retracement zone of that swing
+Liquidity sweep: ${filterResult.sweep && filterResult.sweep.swept ? `CONFIRMED - price wicked through a prior swing point at $${filterResult.sweep.level} and closed back through it (stop hunt pattern)` : 'not confirmed in the recent lookback window'}
+Fair Value Gap confluence: ${filterResult.fvgMatch ? `price is sitting inside an unmitigated FVG ($${filterResult.fvgMatch.bottom.toFixed(6)}-$${filterResult.fvgMatch.top.toFixed(6)})` : 'no FVG currently overlapping price'}
 Session: ${sessionInfo.summary}
 
 Your job is ONLY to judge context and confidence - not to invent price levels:
 - Does the session timing support this setup (kill zone or Asian bias)?
+- Does the liquidity sweep and FVG evidence above (if present) strengthen this setup, or does its absence weaken it?
 - Does anything about the price action narrative undermine the technical confluence above?
 - Give a confidence rating and brief reasoning.
 
@@ -1397,6 +1555,17 @@ Respond ONLY with valid JSON, no extra text:
         return `<div class="row muted">Volume displacement: ${trade.volumeRatio.toFixed(2)}x the 20-bar average (institutional threshold: ${VOLUME_DISPLACEMENT_RATIO}x)</div>`;
     }
 
+    function renderConfluenceSection(trade) {
+        if (trade.sweepConfirmed === undefined && trade.fvgConfluence === undefined) return '';
+        const sweepText = trade.sweepConfirmed
+            ? `<span class="success">Liquidity sweep: confirmed</span>${trade.sweepLevel !== null ? ` (swept prior level ~$${trade.sweepLevel})` : ''}`
+            : `<span class="muted">Liquidity sweep: not confirmed</span>`;
+        const fvgText = trade.fvgConfluence
+            ? `<span class="success">FVG confluence: yes</span>${trade.fvgRange ? ` ($${trade.fvgRange.bottom.toFixed(6)}-$${trade.fvgRange.top.toFixed(6)})` : ''}`
+            : `<span class="muted">FVG confluence: no</span>`;
+        return `<div class="row">${sweepText} | ${fvgText}</div>`;
+    }
+
     function renderTradeCard(trade) {
         const cards = document.getElementById('cards');
         const cls = trade.direction === 'Long' ? 'long' : 'short';
@@ -1409,6 +1578,7 @@ Respond ONLY with valid JSON, no extra text:
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
             ${renderVolumeSection(trade)}
+            ${renderConfluenceSection(trade)}
             <div class="row muted">${trade.notes}</div>
             <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
             ${renderNewsSection(trade.newsCheck)}
@@ -1498,7 +1668,7 @@ Respond ONLY with valid JSON, no extra text:
             };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.closesLTF, candles.volumesLTF, currentPrice, direction);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         // Decide whether this is a "buy/sell now" (market) or "wait for a
@@ -1570,7 +1740,11 @@ Respond ONLY with valid JSON, no extra text:
                 orderLabel: orderInfo.orderLabel,
                 currentPrice: currentPrice.toFixed(6),
                 distancePct: orderInfo.distancePct,
-                volumeRatio: filterResult.volumeRatio
+                volumeRatio: filterResult.volumeRatio,
+                sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
+                sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
+                fvgConfluence: !!filterResult.fvgMatch,
+                fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null
             }
         };
     }
@@ -1594,6 +1768,7 @@ Respond ONLY with valid JSON, no extra text:
 
         saveConfig();
         const config = getConfig();
+        currentGeminiRpm = config.geminiRpm;
 
         const breaker = checkCircuitBreaker(config);
         renderCircuitBreakerStatus();
@@ -1664,54 +1839,6 @@ Respond ONLY with valid JSON, no extra text:
                     log(`${symbol} (${direction}): VALID setup found - logged to journal.${newsNote}`, 'success');
                 } else {
                     log(`${symbol} (${direction}): skipped - ${result.reason}`);
-                }
-
-                await sleep(300); // small courtesy delay between coins
-            }
-
-            setProgress(total, total, 'Done');
-            log('\n=== Run complete ===');
-            renderJournal();
-            renderCircuitBreakerStatus();
-            log(`Long setups: ${lastValidTrades.longs.length} | Short setups: ${lastValidTrades.shorts.length}`);
-            if (lastValidTrades.longs.length === 0 && lastValidTrades.shorts.length === 0) {
-                log('No valid trades this run. Try lowering the momentum threshold in Settings, or re-run during a kill zone.');
-            } else {
-                rankAndRerenderCards();
-                if (lastValidTrades.longs.length + lastValidTrades.shorts.length > 1) {
-                    log('Multiple setups triggered this run - cards above are ranked by volume displacement (strongest institutional push first).', 'success');
-                }
-                document.getElementById('copyBtn').style.display = 'block';
-            }
-            log('\nReminder: verify every setup manually before acting. AI output is context, not certainty.', 'error');
-
-            const nextRun = suggestNextRunTime(sessionInfo, config.displayTimezone);
-            log(`\nNext run suggestion: ${nextRun.message}`, 'success');
-            const suggestionEl = document.getElementById('nextRunSuggestion');
-            suggestionEl.style.display = 'block';
-            suggestionEl.innerHTML = `<strong>Next run suggestion:</strong> ${nextRun.message}`;
-
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                log('\nRun cancelled by user.', 'error');
-            } else {
-                log(`\nGlobal Error: ${error.message}`, 'error');
-            }
-        } finally {
-            isRunning = false;
-            currentController = null;
-            document.getElementById('runBtn').disabled = false;
-            document.getElementById('cancelBtn').style.display = 'none';
-        }
-    }
-
-    function cancelAnalysis() {
-        if (currentController) currentController.abort();
-    }
-
-    loadConfig();
-    renderJournal();
-    renderCircuitBreakerStatus();
-</script>
-</body>
-</html>
+                    if (/\b429\b|quota/i.test(result.reason)) {
+                        log(`\nGemini quota exceeded - stopping the scan here instead of retrying the same error on every remaining candidate (${total - i - 1} left unscanned).`, 'error');
+                        log('This is a Google API-side limit, not an app bug. Fixes: lower "Gemini requests/minute" in Settings, reduce Candidates per side, wait a bi
