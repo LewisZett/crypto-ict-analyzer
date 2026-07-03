@@ -82,8 +82,28 @@
             <input type="number" id="momentumThreshold" value="3" min="0.1" step="0.1">
         </div>
         <div>
-            <label for="targetRR">Target Risk:Reward</label>
+            <label for="targetRR">Target Risk:Reward (used when TP Mode = Fixed RR)</label>
             <input type="number" id="targetRR" value="3" min="1" step="0.5">
+        </div>
+        <div>
+            <label for="tpMode">TP Mode (live run only)</label>
+            <select id="tpMode">
+                <option value="fixedRR">Fixed RR (flat multiple of risk, every trade)</option>
+                <option value="fibExtension">Fibonacci Extension (adaptive per-trade, with RR floor)</option>
+            </select>
+        </div>
+        <div>
+            <label for="extensionRatio">Extension ratio (used when TP Mode = Fibonacci Extension)</label>
+            <select id="extensionRatio">
+                <option value="1.272">127.2%</option>
+                <option value="1.414">141.4%</option>
+                <option value="1.618" selected>161.8%</option>
+                <option value="2.0">200%</option>
+            </select>
+        </div>
+        <div>
+            <label for="minRRFloor">Min RR floor (used when TP Mode = Fibonacci Extension)</label>
+            <input type="number" id="minRRFloor" value="2.5" min="1" step="0.1">
         </div>
         <div>
             <label for="candidateCount">Candidates per side (max)</label>
@@ -132,6 +152,18 @@
     <div id="backtestLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:220px; overflow:auto;"></div>
 </details>
 
+<details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
+    <summary><strong>Batch Backtest / RR Sweep (no API key needed)</strong> - tests many symbols and/or many RR values in one run</summary>
+    <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value you list against those same trades - so instead of one symbol / one guessed RR, you get a real aggregate sample size and a direct side-by-side comparison of which RR actually performs best, rather than assuming.</p>
+    <label for="batchSymbols">Symbols (comma-separated, must have Binance USDT pairs)</label>
+    <input type="text" id="batchSymbols" value="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,LINK,AVAX,DOT,LTC,BCH">
+    <label for="batchRRValues">RR values to test (comma-separated)</label>
+    <input type="text" id="batchRRValues" value="1.5,2,2.5,3,3.5,4">
+    <button id="batchBacktestBtn" onclick="runBatchBacktest()">Run Batch Backtest / RR Sweep</button>
+    <div id="batchBacktestResults" style="margin-top:8px; overflow-x:auto;"></div>
+    <div id="batchBacktestLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:220px; overflow:auto;"></div>
+</details>
+
 <details open style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
     <summary><strong>Trade Journal</strong> - every recommendation from a live run is saved here automatically</summary>
     <p class="muted">Nothing here is graded until you click "Check Outcomes" - that pulls the real candles that happened after each trade was logged and checks whether price actually hit TP or SL. This is the honest record of how live signals did; the cards above are not.</p>
@@ -158,7 +190,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'killzoneOnly', 'displayTimezone'];
+    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -190,6 +222,9 @@
             geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
             strictConfluence: document.getElementById('strictConfluence').checked,
             killzoneOnly: document.getElementById('killzoneOnly').checked,
+            tpMode: document.getElementById('tpMode').value,
+            extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
+            minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
             displayTimezone: document.getElementById('displayTimezone').value
         };
     }
@@ -696,6 +731,73 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
+    // Fibonacci extension TP (Phase 9, live run only). Instead of a flat
+    // RR multiple applied to every trade regardless of the actual swing,
+    // this projects the swing's own range beyond its high (bullish) or
+    // low (bearish) by a chosen extension ratio (127.2% / 141.4% / 161.8%
+    // / 200% are the standard ICT reference levels) - the same idea as
+    // computeOptimalEntry's 70.5% OTE sweet spot, but applied to the exit
+    // instead of the entry. This lets TP sit where price has historically
+    // tended to react on THIS specific move, rather than an arbitrary
+    // distance with no relationship to the swing's own structure.
+    // ------------------------------------------------------------------
+    function computeFibExtensionLevel(swing, direction, extensionRatio) {
+        const range = swing.high - swing.low;
+        return direction === 'bullish'
+            ? swing.low + range * extensionRatio
+            : swing.high - range * extensionRatio;
+    }
+
+    // Adaptive trade-level calculator used by the LIVE run. SL is always
+    // computed identically to computeTradeLevels (same structural buffer
+    // logic) regardless of TP mode - only TP placement differs:
+    //   - 'fixedRR'      : same flat-multiple behavior as before (default).
+    //   - 'fibExtension' : TP is placed at the swing's actual Fibonacci
+    //                      extension level, UNLESS that level implies a
+    //                      reward below the user's minRRFloor - in that
+    //                      case it falls back to a flat-RR TP at exactly
+    //                      the floor, so a trade is never accepted below
+    //                      the user's stated minimum acceptable reward
+    //                      while still capturing MORE reward whenever the
+    //                      real swing structure offers it.
+    // Returns null if the computed risk is zero/invalid (same contract as
+    // computeTradeLevels), otherwise { entry, sl, tp, rr, tpMode, extensionRatio? }.
+    function computeAdaptiveTradeLevels(direction, entry, swing, config) {
+        const legSize = swing.high - swing.low;
+        const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
+
+        let sl, risk;
+        if (direction === 'bullish') {
+            sl = swing.low - structuralBuffer;
+            risk = entry - sl;
+        } else {
+            sl = swing.high + structuralBuffer;
+            risk = sl - entry;
+        }
+        if (risk <= 0) return null;
+
+        if (config.tpMode !== 'fibExtension') {
+            const rr = config.targetRR;
+            const tp = direction === 'bullish' ? entry + risk * rr : entry - risk * rr;
+            return { entry, sl, tp, rr, tpMode: 'fixedRR' };
+        }
+
+        const extLevel = computeFibExtensionLevel(swing, direction, config.extensionRatio);
+        const extRR = direction === 'bullish' ? (extLevel - entry) / risk : (entry - extLevel) / risk;
+
+        if (extRR >= config.minRRFloor) {
+            return { entry, sl, tp: extLevel, rr: extRR, tpMode: 'fibExtension', extensionRatio: config.extensionRatio };
+        }
+
+        // Real extension implies less reward than the floor allows - do NOT
+        // silently accept a worse-than-floor trade. Fall back to a flat-RR
+        // TP at exactly the floor instead.
+        const floorRR = config.minRRFloor;
+        const tp = direction === 'bullish' ? entry + risk * floorRR : entry - risk * floorRR;
+        return { entry, sl, tp, rr: floorRR, tpMode: 'rrFloor', extensionRatio: config.extensionRatio };
+    }
+
+    // ------------------------------------------------------------------
     // Kill zone / session logic (computed in UTC to avoid DST/locale bugs,
     // displayed in the user's chosen timezone). Windows mirror standard
     // approximate ICT session times; treat as approximate, not authoritative.
@@ -826,6 +928,55 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }));
     }
 
+    // ------------------------------------------------------------------
+    // Detailed variant of fetchKlines used by the live run path (Phase 7).
+    // Unlike fetchKlines above (which just returns null on any failure and
+    // lets the caller lump every cause into one vague "fetch failed"
+    // message), this distinguishes WHY the fetch failed so the run log can
+    // say something actionable instead of a generic "Failed to fetch":
+    //   - 'no_pair'    : Binance returned a 4xx specifically because the
+    //                    symbol doesn't exist on their exchange (e.g. -1121
+    //                    "Invalid symbol"). Nothing to retry - this coin
+    //                    just isn't listed as SYMBOLUSDT on Binance spot.
+    //   - 'http_error' : Binance responded but with some other non-2xx
+    //                    status (rate limit after retries exhausted,
+    //                    5xx server error, etc.) - transient/server-side.
+    //   - 'network'    : the fetch() call itself threw (DNS failure, CORS,
+    //                    offline, connection reset) before any HTTP
+    //                    response was received at all - a local/connectivity
+    //                    problem, not a Binance-side rejection.
+    // Never throws (except to propagate a real AbortError) - callers get a
+    // structured result back either way.
+    // ------------------------------------------------------------------
+    async function fetchKlinesDetailed(symbol, interval, limit, signal, startTime) {
+        let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        if (startTime) url += `&startTime=${startTime}`;
+        try {
+            const res = await fetchWithRetry(url, { signal });
+            if (res.ok) {
+                const raw = await res.json();
+                const klines = raw.map(k => ({
+                    openTime: k[0], closeTime: k[6],
+                    high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]),
+                    volume: parseFloat(k[5])
+                }));
+                return { ok: true, klines };
+            }
+            let bodyText = '';
+            try { bodyText = await res.text(); } catch (e) { /* ignore */ }
+            const isInvalidSymbol = res.status === 400 && /invalid symbol/i.test(bodyText);
+            return {
+                ok: false,
+                reason: isInvalidSymbol ? 'no_pair' : 'http_error',
+                status: res.status,
+                detail: bodyText.slice(0, 150)
+            };
+        } catch (err) {
+            if (err.name === 'AbortError') throw err; // real cancel - let it propagate
+            return { ok: false, reason: 'network', status: null, detail: err.message };
+        }
+    }
+
     // Expected max gap (ms) between "now" and the most recent CLOSED candle
     // before we consider the feed stale. Generous buffer for network/clock
     // skew, but tight enough to catch a genuinely frozen/cached feed.
@@ -843,18 +994,30 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { stale: ageMs > limit, ageMs };
     }
 
+    // Returns { ok: true, closesHTF, closesLTF, volumesLTF, candlesLTF, dataQuality }
+    // on success, or { ok: false, reason, status, detail } on failure - reason is
+    // one of 'no_pair' | 'http_error' | 'network' (see fetchKlinesDetailed above).
+    // If both the 1h and 5m fetches fail for different reasons, the 1h failure
+    // reason wins (arbitrary but consistent - in practice both legs fail for the
+    // same underlying cause since they hit the same symbol/endpoint).
     async function fetchCoinCandles(coin, signal) {
         const symbol = binanceSymbolFor(coin);
-        const [klines1h, klines5m] = await Promise.all([
-            fetchKlines(symbol, '1h', 168, signal),  // ~7 days of hourly data (HTF)
-            fetchKlines(symbol, '5m', 100, signal)   // ~8 hours of 5-min data (LTF)
+        const [r1h, r5m] = await Promise.all([
+            fetchKlinesDetailed(symbol, '1h', 168, signal),  // ~7 days of hourly data (HTF)
+            fetchKlinesDetailed(symbol, '5m', 100, signal)   // ~8 hours of 5-min data (LTF)
         ]);
-        if (!klines1h || !klines5m) return null;
 
+        if (!r1h.ok || !r5m.ok) {
+            const failed = !r1h.ok ? r1h : r5m;
+            return { ok: false, reason: failed.reason, status: failed.status, detail: failed.detail };
+        }
+
+        const klines1h = r1h.klines, klines5m = r5m.klines;
         const htfStale = checkStaleness(klines1h, '1h');
         const ltfStale = checkStaleness(klines5m, '5m');
 
         return {
+            ok: true,
             closesHTF: klines1h.map(k => k.close),
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
@@ -1075,6 +1238,149 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
+    // Batch Backtest / RR Sweep (Phase 8). Answers two problems with the
+    // single-symbol backtest above: (1) one symbol over a few days of 5m
+    // data is too small a sample to trust, and (2) comparing RR values
+    // required manually re-running the whole backtest and eyeballing the
+    // difference. This fetches candles for every listed symbol ONCE, then
+    // replays every listed RR value against those same fetched candles -
+    // so the comparison across RR values is apples-to-apples (same entries,
+    // same market data), and the sample size is the SUM of signals across
+    // every symbol instead of whatever one coin happened to produce.
+    // ------------------------------------------------------------------
+    function parseSymbolList(raw) {
+        return Array.from(new Set(
+            raw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+                .map(s => s.endsWith('USDT') ? s : s + 'USDT')
+        ));
+    }
+
+    function parseRRList(raw) {
+        return Array.from(new Set(
+            raw.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v) && v > 0)
+        )).sort((a, b) => a - b);
+    }
+
+    async function runBatchBacktest() {
+        const btn = document.getElementById('batchBacktestBtn');
+        const logEl = document.getElementById('batchBacktestLog');
+        const resultsEl = document.getElementById('batchBacktestResults');
+        logEl.innerHTML = '';
+        resultsEl.innerHTML = '';
+        const blog = (msg, cls) => {
+            logEl.innerHTML += cls ? `<span class="${cls}">${msg}</span>\n` : `${msg}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        };
+
+        const symbols = parseSymbolList(document.getElementById('batchSymbols').value);
+        const rrValues = parseRRList(document.getElementById('batchRRValues').value);
+
+        if (symbols.length === 0) { blog('Enter at least one symbol.', 'error'); return; }
+        if (rrValues.length === 0) { blog('Enter at least one valid RR value.', 'error'); return; }
+
+        const config = getConfig();
+        const maxHoldBars = 288; // 24h max hold, same as single backtest
+
+        btn.disabled = true;
+        try {
+            blog(`Fetching historical candles for ${symbols.length} symbol(s): ${symbols.join(', ')}...`);
+            const controller = new AbortController();
+            const symbolData = [];
+
+            for (const symbol of symbols) {
+                const [klines1h, klines5m] = await Promise.all([
+                    fetchKlines(symbol, '1h', 500, controller.signal),   // ~20 days
+                    fetchKlines(symbol, '5m', 1000, controller.signal)   // ~3.5 days
+                ]);
+                if (!klines1h || !klines5m) {
+                    blog(`${symbol}: no Binance pair or fetch failed - skipped.`, 'error');
+                    continue;
+                }
+                symbolData.push({ symbol, klines1h, klines5m });
+                blog(`${symbol}: got ${klines1h.length} 1h / ${klines5m.length} 5m candles.`);
+                await sleep(200); // courtesy delay across sequential Binance requests
+            }
+
+            if (symbolData.length === 0) {
+                blog('\nNo symbols returned usable data - nothing to test.', 'error');
+                return;
+            }
+
+            blog(`\nTesting ${rrValues.length} RR value(s) across ${symbolData.length} symbol(s)`
+                + `${config.strictConfluence ? ' | STRICT confluence ON' : ' | strict confluence OFF'}`
+                + `${config.killzoneOnly ? ' | KILL ZONE ONLY ON' : ' | kill zone restriction OFF'}`
+                + ` (settings taken from the Settings panel above)...\n`);
+
+            // Same fetched candles are reused for every RR value - entry logic
+            // and structure don't change with RR, only where TP is placed, so
+            // this is a fair apples-to-apples comparison across RR values.
+            const rrResults = rrValues.map(rr => {
+                let allTrades = [];
+                let longCount = 0, shortCount = 0;
+                symbolData.forEach(({ klines1h, klines5m }) => {
+                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly);
+                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly);
+                    longCount += longTrades.length;
+                    shortCount += shortTrades.length;
+                    allTrades = allTrades.concat(longTrades, shortTrades);
+                });
+                return { rr, longCount, shortCount, stats: summarizeBacktest(allTrades) };
+            });
+
+            const bestByTotalR = rrResults.reduce((best, r) =>
+                (r.stats.count > 0 && r.stats.totalR > (best ? best.stats.totalR : -Infinity)) ? r : best, null);
+
+            resultsEl.innerHTML = `
+                <table style="width:100%; border-collapse:collapse; font-size:13px;">
+                    <thead>
+                        <tr style="text-align:left; border-bottom:2px solid #ddd;">
+                            <th style="padding:4px;">RR</th>
+                            <th style="padding:4px;">Signals (L/S)</th>
+                            <th style="padding:4px;">W/L/Timeout</th>
+                            <th style="padding:4px;">Win Rate</th>
+                            <th style="padding:4px;">Avg R</th>
+                            <th style="padding:4px;">Total R</th>
+                            <th style="padding:4px;">Max DD</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rrResults.map(r => {
+                            const s = r.stats;
+                            const isBest = bestByTotalR && r.rr === bestByTotalR.rr;
+                            return `
+                            <tr style="border-bottom:1px solid #eee; ${isBest ? 'background:#eaffea; font-weight:bold;' : ''}">
+                                <td style="padding:4px;">${r.rr}:1${isBest ? ' &#9733;' : ''}</td>
+                                <td style="padding:4px;">${s.count} (${r.longCount}/${r.shortCount})</td>
+                                <td style="padding:4px;">${s.wins}/${s.losses}/${s.timeouts}</td>
+                                <td style="padding:4px;">${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'}</td>
+                                <td style="padding:4px;">${s.avgRR !== null ? s.avgRR.toFixed(2) : 'n/a'}</td>
+                                <td style="padding:4px;">${s.totalR.toFixed(2)}</td>
+                                <td style="padding:4px;">${s.maxDrawdownR.toFixed(2)}R</td>
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+
+            blog(`Done. Tested across ${symbolData.length} symbol(s): ${symbolData.map(d => d.symbol).join(', ')}.`, 'success');
+            if (bestByTotalR) {
+                blog(`Highest total R: RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate).`, 'success');
+            } else {
+                blog('No signals triggered for any RR value in this window - try loosening Strict Confluence or Kill Zone Only in Settings, or widen the symbol list.', 'error');
+            }
+
+            const lowSampleRows = rrResults.filter(r => r.stats.count > 0 && r.stats.count < 20);
+            if (lowSampleRows.length > 0) {
+                blog(`\nSample size note: ${lowSampleRows.map(r => `RR ${r.rr} (${r.stats.count} signals)`).join(', ')} still have under ~20 signals - treat those rows as directional, not conclusive. RR rows with more signals are more trustworthy. This is still limited by how far back Binance's free klines endpoint goes (~3.5 days of 5m data), so re-run periodically as more history accumulates, or widen the symbol list further.`, 'error');
+            }
+        } catch (e) {
+            blog(`Batch backtest error: ${e.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Auto-journal (persisted trade log with later outcome checking).
     // Every trade a live run recommends gets saved locally as "pending."
     // "Check Outcomes" later fetches the ACTUAL 5m candles that happened
@@ -1143,6 +1449,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             sweepLevel: trade.sweepLevel !== undefined ? trade.sweepLevel : null,
             fvgConfluence: trade.fvgConfluence !== undefined ? trade.fvgConfluence : null,
             fvgRange: trade.fvgRange || null,
+            tpMode: trade.tpMode || null,
+            extensionRatioUsed: trade.extensionRatioUsed || null,
             loggedAt: Date.now(),
             status: 'pending',
             resolvedAt: null,
@@ -1194,10 +1502,16 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const confluenceText = (e.sweepConfirmed !== null && e.sweepConfirmed !== undefined)
                 ? `Sweep: ${e.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${e.fvgConfluence ? 'yes' : 'no'}`
                 : 'Not recorded for this entry.';
+            const tpModeText = !e.tpMode || e.tpMode === 'fixedRR'
+                ? 'Fixed RR'
+                : e.tpMode === 'fibExtension'
+                    ? `Fibonacci extension (${e.extensionRatioUsed ? (e.extensionRatioUsed * 100).toFixed(1) + '%' : '?'})`
+                    : `Extension below floor - flat floor RR used${e.extensionRatioUsed ? ` (extension was ${(e.extensionRatioUsed * 100).toFixed(1)}%)` : ''}`;
             return `
                 <details class="row" style="background:#fafafa; border-radius:4px; padding:4px 8px; margin-bottom:4px;">
                     <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
-                    <div class="row" style="margin-top:6px;">Entry: $${e.entry} | SL: $${e.sl} | TP: $${e.tp} | RR: ${e.rr}:1</div>
+                    <div class="row" style="margin-top:6px;">Entry: $${e.entry} | SL: $${e.sl} | TP: $${e.tp} | RR: ${(typeof e.rr === 'number' ? e.rr.toFixed(2) : e.rr)}:1</div>
+                    <div class="row">TP mode: ${tpModeText}</div>
                     <div class="row">Order type: ${orderText}</div>
                     <div class="row">Position: ${sizingText}</div>
                     <div class="row">Volume displacement at signal: ${volText}</div>
@@ -1377,7 +1691,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,notes\n';
+        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,tpMode,extensionRatioUsed,notes\n';
         const rows = journal.map(e => [
             e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
@@ -1388,6 +1702,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             e.volumeRatio !== null && e.volumeRatio !== undefined ? e.volumeRatio.toFixed(4) : '',
             e.sweepConfirmed === true ? 'true' : e.sweepConfirmed === false ? 'false' : '',
             e.fvgConfluence === true ? 'true' : e.fvgConfluence === false ? 'false' : '',
+            e.tpMode || '', e.extensionRatioUsed !== null && e.extensionRatioUsed !== undefined ? e.extensionRatioUsed : '',
             `"${(e.notes || '').replace(/"/g, '""')}"`
         ].join(',')).join('\n');
         const blob = new Blob([header + rows], { type: 'text/csv' });
@@ -1468,6 +1783,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         volumeRatio: numOrUndefined('volumeRatio') ?? null,
                         sweepConfirmed: boolOrNull('sweepConfirmed'),
                         fvgConfluence: boolOrNull('fvgConfluence'),
+                        tpMode: get('tpMode') || null,
+                        extensionRatioUsed: numOrUndefined('extensionRatioUsed') ?? null,
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
                         // Force all imported entries to pending, with no resolved outcome.
                         status: 'pending',
@@ -1603,6 +1920,18 @@ Respond ONLY with valid JSON, no extra text:
         return `<div class="row">${sweepText} | ${fvgText}</div>`;
     }
 
+    function renderTPModeSection(trade) {
+        if (!trade.tpMode || trade.tpMode === 'fixedRR') return '';
+        const pct = trade.extensionRatioUsed ? `${(trade.extensionRatioUsed * 100).toFixed(1)}%` : '?';
+        if (trade.tpMode === 'fibExtension') {
+            return `<div class="row muted">TP mode: Fibonacci extension (${pct} of swing) - achieved RR ${trade.rr.toFixed(2)}:1, above your floor.</div>`;
+        }
+        if (trade.tpMode === 'rrFloor') {
+            return `<div class="row muted">TP mode: extension (${pct}) fell below your RR floor - TP placed at the flat floor RR instead (${trade.rr.toFixed(2)}:1).</div>`;
+        }
+        return '';
+    }
+
     function renderTradeCard(trade) {
         const cards = document.getElementById('cards');
         const cls = trade.direction === 'Long' ? 'long' : 'short';
@@ -1611,7 +1940,8 @@ Respond ONLY with valid JSON, no extra text:
         div.innerHTML = `
             <h3>${trade.name} (${trade.symbol}) - ${trade.direction}</h3>
             ${renderOrderTypeSection(trade)}
-            <div class="row">Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | RR: ${trade.rr}:1</div>
+            <div class="row">Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | RR: ${(typeof trade.rr === 'number' ? trade.rr.toFixed(2) : trade.rr)}:1</div>
+            ${renderTPModeSection(trade)}
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
             ${renderVolumeSection(trade)}
@@ -1679,7 +2009,14 @@ Respond ONLY with valid JSON, no extra text:
         }
 
         const candles = await fetchCoinCandles(coin, signal);
-        if (!candles) return { success: false, reason: 'No matching Binance USDT pair or candle fetch failed' };
+        if (!candles.ok) {
+            const reasonMessages = {
+                no_pair: `No ${binanceSymbolFor(coin)} pair on Binance - this coin isn't listed there under that symbol`,
+                http_error: `Binance API error${candles.status ? ` (HTTP ${candles.status})` : ''} fetching candle data${candles.detail ? ` - ${candles.detail}` : ''}`,
+                network: `Network error reaching Binance - check your connection and try again${candles.detail ? ` (${candles.detail})` : ''}`
+            };
+            return { success: false, reason: reasonMessages[candles.reason] || 'Candle fetch failed for an unrecognized reason' };
+        }
 
         if (candles.closesHTF.length < 24) return { success: false, reason: 'Insufficient 1h candle history' };
         if (candles.closesLTF.length < 20) return { success: false, reason: 'Insufficient 5m candle history' };
@@ -1717,7 +2054,7 @@ Respond ONLY with valid JSON, no extra text:
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
         const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
 
-        const levels = computeTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config.targetRR);
+        const levels = computeAdaptiveTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config);
         if (!levels) return { success: false, reason: 'Computed risk distance was zero/invalid - skipped' };
 
         const prompt = buildPrompt(coin, direction, currentPrice.toFixed(6), filterResult, sessionInfo, change24h);
@@ -1781,7 +2118,9 @@ Respond ONLY with valid JSON, no extra text:
                 sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
                 sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
                 fvgConfluence: !!filterResult.fvgMatch,
-                fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null
+                fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
+                tpMode: levels.tpMode,
+                extensionRatioUsed: levels.extensionRatio || null
             }
         };
     }
