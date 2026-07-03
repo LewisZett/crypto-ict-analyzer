@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Crypto ICT Sniper App</title>
+<title>ICT Sniper App (Crypto + Forex)</title>
 <style>
     body { font-family: Arial, sans-serif; margin: 10px; background: #f4f4f4; }
     h1, h2, h3 { color: #333; }
@@ -48,12 +48,20 @@
     4. Not every coin in the CoinGecko top-50 has a matching USDT pair on
        Binance. Those coins are skipped with a clear reason rather than
        causing an error.
-    5. This tool is for education/research only. It is not financial advice.
+    5. Forex mode uses Twelve Data (https://twelvedata.com) for both
+       quotes (momentum screening) and OHLC candles - get a free API key
+       there. Twelve Data's free tier is rate-limited (~8 requests/min,
+       daily credit cap), so the app throttles calls the same way it
+       throttles Gemini. Forex has no centralized volume feed, so the
+       volume-displacement check auto-passes for forex trades, and the
+       market is closed roughly Friday 22:00 UTC - Sunday 22:00 UTC - runs
+       are blocked during that window rather than misread as stale data.
+    6. This tool is for education/research only. It is not financial advice.
        All AI-assisted output should be manually verified before use.
 -->
 
-<h1>Crypto ICT Price Action Analysis App</h1>
-<p>Screens the CoinGecko top 50 by market cap, filters for momentum + local ICT-style confluence (moving average, market structure, Fibonacci OTE) computed in JavaScript, then asks Gemini AI to judge context/session quality only for candidates that already pass the hard technical rules.</p>
+<h1>ICT Price Action Analysis App</h1>
+<p>Pick a market below. Crypto screens the CoinGecko top 50 by market cap with candles from Binance; Forex screens your configured pair list with quotes and candles from Twelve Data. Either way, the same local filter (moving average, market structure, Fibonacci OTE, liquidity sweep, FVG) computed in JavaScript decides what's even worth asking about, then Gemini AI judges context/session quality only for candidates that already pass the hard technical rules.</p>
 
 <div class="disclaimer">
     <strong>Disclaimer:</strong> Educational/research tool only. Not financial advice. AI-generated trade plans must be manually verified before acting on them.
@@ -63,8 +71,21 @@
 </div>
 <div class="disclaimer" id="circuitBreakerStatus" style="display:none;"></div>
 
+<label for="marketType">Market:</label>
+<select id="marketType" onchange="onMarketTypeChange()">
+    <option value="crypto">Crypto (CoinGecko screening + Binance candles)</option>
+    <option value="forex">Forex (Twelve Data quotes + candles)</option>
+</select>
+<div class="note" id="cryptoOnlyNote">Screens the CoinGecko top 50 by market cap; candles come from Binance.</div>
+<div class="note" id="forexOnlyNote" style="display:none;">Screens your configured pair list (below) using Twelve Data quotes and candles. Forex has no centralized volume feed, so the volume-displacement check auto-passes. The market is closed on weekends - runs are blocked during that window instead of misreading it as stale data.</div>
+
 <label for="geminiKey">Gemini API Key:</label>
 <input type="password" id="geminiKey" placeholder="Paste your Gemini API key here">
+
+<div id="twelveDataKeyWrap" style="display:none;">
+    <label for="twelveDataKey">Twelve Data API Key:</label>
+    <input type="password" id="twelveDataKey" placeholder="Paste your Twelve Data API key here">
+</div>
 
 <details>
     <summary><strong>Settings</strong> (risk, thresholds, timezone)</summary>
@@ -105,13 +126,21 @@
             <label for="minRRFloor">Min RR floor (used when TP Mode = Fibonacci Extension)</label>
             <input type="number" id="minRRFloor" value="2.5" min="1" step="0.1">
         </div>
-        <div>
+        <div id="cryptoCandidateNote">
             <label for="candidateCount">Candidates per side (max)</label>
             <input type="number" id="candidateCount" value="10" min="1" max="25">
         </div>
         <div>
             <label for="geminiRpm">Gemini requests/minute (free tier: ~8-10)</label>
             <input type="number" id="geminiRpm" value="8" min="1" max="60">
+        </div>
+        <div id="twelveDataRpmBlock" style="display:none;">
+            <label for="twelveDataRpm">Twelve Data requests/minute (free tier: 8)</label>
+            <input type="number" id="twelveDataRpm" value="8" min="1" max="60">
+        </div>
+        <div id="forexPairsBlock" style="display:none; grid-column: 1 / -1;">
+            <label for="forexPairs">Forex pairs to scan (comma-separated, e.g. EUR/USD)</label>
+            <input type="text" id="forexPairs" value="EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD,EUR/GBP,EUR/JPY,GBP/JPY">
         </div>
         <div>
             <label for="strictConfluence" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
@@ -145,7 +174,7 @@
 <details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
     <summary><strong>Backtest (no API key needed)</strong> - tests the local filter logic against recent historical data</summary>
     <p class="muted">This does NOT call Gemini - it only replays the deterministic MA/structure/OTE/SL/TP rules against past candles, so you can see how the filter itself would have performed before trusting any of its live signals.</p>
-    <label for="backtestSymbol">Symbol (must have a Binance USDT pair)</label>
+    <label for="backtestSymbol">Symbol (Binance USDT pair for crypto, or Twelve Data pair like EUR/USD for forex)</label>
     <input type="text" id="backtestSymbol" placeholder="e.g. BTC, ETH, SOL" value="BTC">
     <button id="backtestBtn" onclick="runBacktest()">Run Backtest</button>
     <div id="backtestResults" style="margin-top:8px;"></div>
@@ -155,7 +184,7 @@
 <details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
     <summary><strong>Batch Backtest / RR Sweep (no API key needed)</strong> - tests many symbols and/or many RR values in one run</summary>
     <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value you list against those same trades - so instead of one symbol / one guessed RR, you get a real aggregate sample size and a direct side-by-side comparison of which RR actually performs best, rather than assuming.</p>
-    <label for="batchSymbols">Symbols (comma-separated, must have Binance USDT pairs)</label>
+    <label for="batchSymbols">Symbols (comma-separated; Binance USDT pairs for crypto, or Twelve Data pairs like EUR/USD for forex)</label>
     <input type="text" id="batchSymbols" value="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,LINK,AVAX,DOT,LTC,BCH">
     <label for="batchRRValues">RR values to test (comma-separated)</label>
     <input type="text" id="batchRRValues" value="1.5,2,2.5,3,3.5,4">
@@ -166,7 +195,7 @@
 
 <details open style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
     <summary><strong>Trade Journal</strong> - every recommendation from a live run is saved here automatically</summary>
-    <p class="muted">Nothing here is graded until you click "Check Outcomes" - that pulls the real candles that happened after each trade was logged and checks whether price actually hit TP or SL. This is the honest record of how live signals did; the cards above are not.</p>
+    <p class="muted">Nothing here is graded until you click "Check Outcomes" - that pulls the real candles that happened after each trade was logged and checks whether price actually hit TP or SL. This is the honest record of how live signals did - the cards above are not.</p>
     <div id="journalSummary"></div>
     <button id="journalCheckBtn" onclick="checkJournalOutcomes()">Check Outcomes</button>
     <button onclick="exportJournalCSV()" style="background:#6c757d;">Export CSV</button>
@@ -190,7 +219,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -214,18 +243,21 @@
 
     function getConfig() {
         return {
+            marketType: document.getElementById('marketType').value,
             accountBalance: parseFloat(document.getElementById('accountBalance').value) || 1000,
             riskPercent: parseFloat(document.getElementById('riskPercent').value) || 1,
             momentumThreshold: parseFloat(document.getElementById('momentumThreshold').value) || 3,
             targetRR: parseFloat(document.getElementById('targetRR').value) || 3,
             candidateCount: Math.max(1, Math.min(25, parseInt(document.getElementById('candidateCount').value) || 10)),
             geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
+            twelveDataRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('twelveDataRpm').value) || 8)),
             strictConfluence: document.getElementById('strictConfluence').checked,
             killzoneOnly: document.getElementById('killzoneOnly').checked,
             tpMode: document.getElementById('tpMode').value,
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
             minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
-            displayTimezone: document.getElementById('displayTimezone').value
+            displayTimezone: document.getElementById('displayTimezone').value,
+            forexPairs: document.getElementById('forexPairs').value.split(',').map(s => s.trim()).filter(Boolean)
         };
     }
 
@@ -444,15 +476,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { high: Math.max(...slice), low: Math.min(...slice) };
     }
 
-    // ------------------------------------------------------------------
-    // Fractal swing-point detection (replaces the old "split the window in
-    // half and compare" heuristic). A bar is a swing high if it's the
-    // highest point among `wing` bars on either side of it; swing low is
-    // the mirror case. This is still a simplification of discretionary ICT
-    // structure reading (a real trader also weighs volume, wick rejection,
-    // liquidity sweeps, etc. that aren't in this data), but it is at least
-    // reading actual pivot sequences instead of two arbitrary buckets.
-    // ------------------------------------------------------------------
     function findFractalSwings(closes, wing = 2) {
         const highs = [], lows = [];
         for (let i = wing; i < closes.length - wing; i++) {
@@ -466,10 +489,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { highs, lows };
     }
 
-    // HH/HL vs LH/LL structure check using the last 3 confirmed swing highs
-    // and lows (needs at least 2 of each to compare sequences). Returns
-    // false (not "unknown") if there isn't enough pivot data - callers
-    // should treat that as "structure not confirmed", not as a pass.
     function checkTrendStructure(closes, direction, lookback, wing = 2) {
         const slice = closes.slice(-lookback);
         const { highs, lows } = findFractalSwings(slice, wing);
@@ -486,9 +505,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return lowerHigh && lowerLow;
     }
 
-    // OTE (Optimal Trade Entry) zone: 61.8%-78.6% Fibonacci retracement.
-    // Bullish: retracement measured down from swing high toward swing low.
-    // Bearish: retracement measured up from swing low toward swing high.
     function getOTEZone(high, low, direction) {
         const range = high - low;
         if (direction === 'bullish') {
@@ -502,18 +518,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return price >= zone.lower && price <= zone.upper;
     }
 
-    // ------------------------------------------------------------------
-    // Order type (market vs limit). The local filter only confirms price
-    // is SOMEWHERE inside the 61.8%-78.6% OTE band - not that it's at the
-    // ideal price within that band. The classic ICT "sweet spot" is the
-    // 70.5% retracement. This tells the user whether current price is
-    // already at (or past) that sweet spot - meaning a market order now is
-    // reasonable - or whether it hasn't retraced far enough yet, in which
-    // case a resting limit order at the sweet-spot price is the correct
-    // way to enter without chasing.
-    // ------------------------------------------------------------------
     const OTE_SWEET_SPOT_RATIO = 0.705;
-    const ORDER_TYPE_TOLERANCE_PCT = 0.15; // price within this % of the sweet spot counts as "there"
+    const ORDER_TYPE_TOLERANCE_PCT = 0.15;
 
     function computeOptimalEntry(high, low, direction) {
         const range = high - low;
@@ -522,12 +528,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             : low + range * OTE_SWEET_SPOT_RATIO;
     }
 
-    // Bullish: a deeper pullback (lower price) is a BETTER price to buy at.
-    //   - If price has already reached (or gone below) the sweet spot, the
-    //     good price is already available now -> market order.
-    //   - If price is still above the sweet spot, place a resting BUY LIMIT
-    //     at the sweet spot and wait for the deeper pullback.
-    // Bearish is the mirror image (higher price is a better price to sell).
     function determineOrderType(currentPrice, optimalEntry, direction) {
         const distancePct = Math.abs(currentPrice - optimalEntry) / currentPrice * 100;
         const alreadyThere = distancePct <= ORDER_TYPE_TOLERANCE_PCT;
@@ -544,20 +544,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { type, entryPrice: type === 'market' ? currentPrice : optimalEntry, optimalEntry, distancePct, orderLabel };
     }
 
-    // Minimum ratio of the most recent LTF volume bar to its trailing
-    // 20-bar average before a structural push is treated as "displacement"
-    // rather than a low-liquidity drift. 1.2x mirrors the reference
-    // threshold used by most ICT displacement checks - loose enough not to
-    // reject every setup, tight enough to filter obvious low-volume drift.
     const VOLUME_DISPLACEMENT_RATIO = 1.2;
 
-    // Volume displacement check: in ICT terms a real Market Structure Shift
-    // needs heavy participation behind it, not just a price wiggle. Returns
-    // { ok, ratio } - ratio is also surfaced to the caller so it can be used
-    // later to RANK multiple simultaneous candidates by how much real
-    // volume is behind each one.
     function checkVolumeDisplacement(volumesLTF) {
-        if (!volumesLTF || volumesLTF.length < 20) return { ok: true, ratio: null }; // not enough data - don't block on it
+        if (!volumesLTF || volumesLTF.length < 20) return { ok: true, ratio: null };
         const recentVolume = volumesLTF[volumesLTF.length - 1];
         const avgVolume = volumesLTF.slice(-20).reduce((a, b) => a + b, 0) / 20;
         if (avgVolume === 0) return { ok: true, ratio: null };
@@ -566,17 +556,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // Liquidity sweep detection. A real ICT reversal typically follows a
-    // stop hunt: price wicks beyond a prior swing point (grabbing resting
-    // stop-loss/breakout orders - "liquidity") and then rejects back
-    // through it. Without this, the filter only knows the pullback landed
-    // inside a Fibonacci band - not that the pullback shows evidence of
-    // being a deliberate hunt rather than a random retracement.
-    // Bullish setups look for a swept SWING LOW (sell-side liquidity) with
-    // a bar that wicked below it but closed back above it. Bearish is the
-    // mirror: a swept SWING HIGH (buy-side liquidity) with a rejection
-    // close back below it. Pivots are detected off actual high/low wicks,
-    // not closes, since a sweep is by definition a wick-only event.
+    // Liquidity sweep detection.
     // ------------------------------------------------------------------
     function findFractalHighLowCandles(candles, wing = 2) {
         const highs = [], lows = [];
@@ -592,7 +572,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { highs, lows };
     }
 
-    const SWEEP_LOOKBACK_BARS = 12; // how recent the sweep + reversal must be, in LTF (5m) bars
+    const SWEEP_LOOKBACK_BARS = 12;
 
     function detectLiquiditySweep(candlesLTF, direction, wing = 2) {
         if (!candlesLTF || candlesLTF.length < wing * 2 + 5) return { swept: false, level: null };
@@ -600,9 +580,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const pivots = direction === 'bullish' ? lows : highs;
         if (pivots.length < 2) return { swept: false, level: null };
 
-        // Reference = the most recent CONFIRMED pivot before the last
-        // couple of bars, so the sweep candle isn't being compared to
-        // itself. This is the "prior liquidity" resting below/above price.
         const reference = pivots[pivots.length - 2];
         const recentBars = candlesLTF.slice(-SWEEP_LOOKBACK_BARS);
 
@@ -621,13 +598,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // Fair Value Gap (FVG) detection. A 3-candle imbalance where candle 1
-    // and candle 3 don't overlap, leaving a gap price often returns to
-    // "fill" before continuing. Requiring the OTE entry to also sit inside
-    // an FVG from the same directional leg is a second, independent piece
-    // of price-action confluence beyond "the retracement % happens to
-    // match" - both a Fibonacci level AND an imbalance agreeing on the
-    // same price is a much less common coincidence than either alone.
+    // Fair Value Gap (FVG) detection.
     // ------------------------------------------------------------------
     function findFVGs(candlesLTF, direction) {
         const fvgs = [];
@@ -647,14 +618,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fvgs.find(g => price >= g.bottom && price <= g.top) || null;
     }
 
-    // Hard local filter. Returns { pass, reason, sma, swing, volumeRatio,
-    // sweep, fvgMatch } - only coins that pass this trigger a Gemini call
-    // at all (Phase 2.2). candlesLTF is the raw OHLCV array (not just
-    // closes) so sweep/FVG detection has real wick data to work with.
-    // When strictConfluence is true, a confirmed liquidity sweep AND an
-    // FVG match are both REQUIRED, not just reported - this is the
-    // highest-conviction, lowest-frequency mode of the filter.
-    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence) {
+    // Hard local filter. `skipVolumeCheck` lets an asset class with no real
+    // volume data (forex) bypass the displacement gate instead of being
+    // penalized for not having something Binance-style crypto candles
+    // provide and forex candles structurally don't.
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence, skipVolumeCheck) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
 
@@ -673,7 +641,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
         if (!inOTE) return { pass: false, reason: 'Price not currently in 61.8-78.6% OTE zone (LTF filter failed)' };
 
-        const volCheck = checkVolumeDisplacement(volumesLTF);
+        const volCheck = skipVolumeCheck ? { ok: true, ratio: null } : checkVolumeDisplacement(volumesLTF);
         if (!volCheck.ok) {
             return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${VOLUME_DISPLACEMENT_RATIO}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
         }
@@ -694,14 +662,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { pass: true, sma, swing, volumeRatio: volCheck.ratio, sweep, fvgMatch };
     }
 
-    // Fraction of the swing leg's total range used as the SL invalidation
-    // cushion. A fixed dollar/percent buffer is either too tight (gets
-    // wicked out on volatile alts) or too loose (wastes R on stable pairs
-    // like BTC) - scaling it to the actual leg size adapts to each coin's
-    // own volatility instead of using one number for every asset.
     const STRUCTURAL_BUFFER_RATIO = 0.10;
 
-    // Deterministic trade levels computed from local data (not from Gemini).
     function computeTradeLevels(direction, entry, swing, targetRR) {
         const legSize = swing.high - swing.low;
         const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
@@ -730,17 +692,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { units, positionUSD, riskAmount };
     }
 
-    // ------------------------------------------------------------------
-    // Fibonacci extension TP (Phase 9, live run only). Instead of a flat
-    // RR multiple applied to every trade regardless of the actual swing,
-    // this projects the swing's own range beyond its high (bullish) or
-    // low (bearish) by a chosen extension ratio (127.2% / 141.4% / 161.8%
-    // / 200% are the standard ICT reference levels) - the same idea as
-    // computeOptimalEntry's 70.5% OTE sweet spot, but applied to the exit
-    // instead of the entry. This lets TP sit where price has historically
-    // tended to react on THIS specific move, rather than an arbitrary
-    // distance with no relationship to the swing's own structure.
-    // ------------------------------------------------------------------
     function computeFibExtensionLevel(swing, direction, extensionRatio) {
         const range = swing.high - swing.low;
         return direction === 'bullish'
@@ -748,20 +699,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             : swing.high - range * extensionRatio;
     }
 
-    // Adaptive trade-level calculator used by the LIVE run. SL is always
-    // computed identically to computeTradeLevels (same structural buffer
-    // logic) regardless of TP mode - only TP placement differs:
-    //   - 'fixedRR'      : same flat-multiple behavior as before (default).
-    //   - 'fibExtension' : TP is placed at the swing's actual Fibonacci
-    //                      extension level, UNLESS that level implies a
-    //                      reward below the user's minRRFloor - in that
-    //                      case it falls back to a flat-RR TP at exactly
-    //                      the floor, so a trade is never accepted below
-    //                      the user's stated minimum acceptable reward
-    //                      while still capturing MORE reward whenever the
-    //                      real swing structure offers it.
-    // Returns null if the computed risk is zero/invalid (same contract as
-    // computeTradeLevels), otherwise { entry, sl, tp, rr, tpMode, extensionRatio? }.
     function computeAdaptiveTradeLevels(direction, entry, swing, config) {
         const legSize = swing.high - swing.low;
         const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
@@ -789,9 +726,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             return { entry, sl, tp: extLevel, rr: extRR, tpMode: 'fibExtension', extensionRatio: config.extensionRatio };
         }
 
-        // Real extension implies less reward than the floor allows - do NOT
-        // silently accept a worse-than-floor trade. Fall back to a flat-RR
-        // TP at exactly the floor instead.
         const floorRR = config.minRRFloor;
         const tp = direction === 'bullish' ? entry + risk * floorRR : entry - risk * floorRR;
         return { entry, sl, tp, rr: floorRR, tpMode: 'rrFloor', extensionRatio: config.extensionRatio };
@@ -799,11 +733,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     // ------------------------------------------------------------------
     // Kill zone / session logic (computed in UTC to avoid DST/locale bugs,
-    // displayed in the user's chosen timezone). Windows mirror standard
-    // approximate ICT session times; treat as approximate, not authoritative.
-    // Shared by both the live-run session banner AND the backtest's
-    // optional kill-zone-only filter, so both paths use the exact same
-    // definition of "in a kill zone" instead of two logics drifting apart.
+    // displayed in the user's chosen timezone).
     // ------------------------------------------------------------------
     function formatTimeInTz(date, displayTz) {
         try {
@@ -814,19 +744,13 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
     }
 
-    // Core kill-zone classification for an arbitrary UTC hour/minute. Used
-    // both for "now" (live run) and for historical candle timestamps
-    // (backtest), so the exact same window definitions apply everywhere.
     function classifyKillZone(utcHour, utcMinute) {
-        const isLKZ = utcHour >= 7 && utcHour < 10;                                   // London KZ ~07:00-10:00 UTC
-        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15; // NY KZ ~13:30-16:00 UTC
-        const isAsian = utcHour >= 23 || utcHour < 7;                                 // Asian session ~23:00-07:00 UTC
+        const isLKZ = utcHour >= 7 && utcHour < 10;
+        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15;
+        const isAsian = utcHour >= 23 || utcHour < 7;
         return { isLKZ, isNYKZ, isAsian, inKillZone: isLKZ || isNYKZ };
     }
 
-    // Convenience wrapper for a millisecond timestamp (e.g. a candle's
-    // closeTime from Binance klines) - used by the backtest's kill-zone-only
-    // filter to classify each historical bar.
     function isTimestampInKillZone(timestampMs) {
         const d = new Date(timestampMs);
         return classifyKillZone(d.getUTCHours(), d.getUTCMinutes()).inKillZone;
@@ -848,16 +772,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         };
     }
 
-    // ------------------------------------------------------------------
-    // Next-run suggestion. ICT kill zones exist because liquidity/volatility
-    // cluster in specific windows - scanning at 3am in the middle of the
-    // Asian session isn't "wrong," but it's scanning during the lowest-
-    // confluence window by the methodology's own logic. This doesn't
-    // predict anything; it just tells you when the next window the
-    // strategy considers high-probability actually starts, and enforces a
-    // sane minimum gap so you're not just re-scanning the same 5m candle.
-    // ------------------------------------------------------------------
-    const MIN_RESCAN_MINUTES = 15; // shortest gap worth re-running at (5m LTF candle plus buffer)
+    const MIN_RESCAN_MINUTES = 15;
 
     function suggestNextRunTime(sessionInfo, displayTz) {
         const now = new Date();
@@ -893,7 +808,40 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // CoinGecko: market screening only (Phase 1.1)
+    // FOREX MARKET HOURS
+    // Forex trades ~24h/5days a week: opens Sunday ~22:00 UTC (Sydney) and
+    // closes Friday ~22:00 UTC (New York). Outside that window there is no
+    // real price movement - treating a closed-market read as "stale data"
+    // would be misleading (it's not a feed problem, the market is simply
+    // shut), so this gets its own explicit check used before any forex
+    // fetch/scan is attempted.
+    // ------------------------------------------------------------------
+    function isForexMarketOpen(date) {
+        const d = date || new Date();
+        const day = d.getUTCDay(); // 0 = Sunday, 6 = Saturday
+        const hour = d.getUTCHours();
+        if (day === 6) return false; // all Saturday closed
+        if (day === 0 && hour < 22) return false; // Sunday before ~22:00 UTC open
+        if (day === 5 && hour >= 22) return false; // Friday after ~22:00 UTC close
+        return true;
+    }
+
+    function forexMarketStatusMessage(displayTz) {
+        const now = new Date();
+        if (isForexMarketOpen(now)) return null;
+        // Find next Sunday 22:00 UTC
+        const next = new Date(now);
+        const day = next.getUTCDay();
+        let daysUntilSunday = (7 - day) % 7;
+        if (day === 0 && next.getUTCHours() < 22) daysUntilSunday = 0;
+        next.setUTCDate(next.getUTCDate() + daysUntilSunday);
+        next.setUTCHours(22, 0, 0, 0);
+        if (next <= now) next.setUTCDate(next.getUTCDate() + 7);
+        return `Forex market is closed for the weekend (opens Sunday ~22:00 UTC, closes Friday ~22:00 UTC). Next open: ${formatTimeInTz(next, displayTz)}.`;
+    }
+
+    // ------------------------------------------------------------------
+    // CoinGecko: market screening only (crypto)
     // ------------------------------------------------------------------
     async function fetchTopMarkets(signal) {
         const params = new URLSearchParams({
@@ -908,7 +856,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // Binance: per-coin candle data (Phase 1.1 / 3.1)
+    // Binance: per-coin candle data (crypto)
     // ------------------------------------------------------------------
     function binanceSymbolFor(coin) {
         return coin.symbol.toUpperCase() + 'USDT';
@@ -918,9 +866,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         if (startTime) url += `&startTime=${startTime}`;
         const res = await fetchWithRetry(url, { signal });
-        if (!res.ok) return null; // e.g. no such pair on Binance - caller decides how to handle
+        if (!res.ok) return null;
         const raw = await res.json();
-        // kline format: [openTime, open, high, low, close, volume, closeTime, ...]
         return raw.map(k => ({
             openTime: k[0], closeTime: k[6],
             high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]),
@@ -928,26 +875,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }));
     }
 
-    // ------------------------------------------------------------------
-    // Detailed variant of fetchKlines used by the live run path (Phase 7).
-    // Unlike fetchKlines above (which just returns null on any failure and
-    // lets the caller lump every cause into one vague "fetch failed"
-    // message), this distinguishes WHY the fetch failed so the run log can
-    // say something actionable instead of a generic "Failed to fetch":
-    //   - 'no_pair'    : Binance returned a 4xx specifically because the
-    //                    symbol doesn't exist on their exchange (e.g. -1121
-    //                    "Invalid symbol"). Nothing to retry - this coin
-    //                    just isn't listed as SYMBOLUSDT on Binance spot.
-    //   - 'http_error' : Binance responded but with some other non-2xx
-    //                    status (rate limit after retries exhausted,
-    //                    5xx server error, etc.) - transient/server-side.
-    //   - 'network'    : the fetch() call itself threw (DNS failure, CORS,
-    //                    offline, connection reset) before any HTTP
-    //                    response was received at all - a local/connectivity
-    //                    problem, not a Binance-side rejection.
-    // Never throws (except to propagate a real AbortError) - callers get a
-    // structured result back either way.
-    // ------------------------------------------------------------------
     async function fetchKlinesDetailed(symbol, interval, limit, signal, startTime) {
         let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         if (startTime) url += `&startTime=${startTime}`;
@@ -972,20 +899,13 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 detail: bodyText.slice(0, 150)
             };
         } catch (err) {
-            if (err.name === 'AbortError') throw err; // real cancel - let it propagate
+            if (err.name === 'AbortError') throw err;
             return { ok: false, reason: 'network', status: null, detail: err.message };
         }
     }
 
-    // Expected max gap (ms) between "now" and the most recent CLOSED candle
-    // before we consider the feed stale. Generous buffer for network/clock
-    // skew, but tight enough to catch a genuinely frozen/cached feed.
     const STALENESS_LIMITS_MS = { '1h': 2 * 60 * 60 * 1000, '5m': 15 * 60 * 1000 };
 
-    // Surfaces staleness instead of silently trusting whatever Binance
-    // returned. A frozen or delayed feed can still return 200 OK with
-    // well-formed (but old) candles - HTTP success doesn't mean the data
-    // is current.
     function checkStaleness(klines, interval) {
         if (!klines || klines.length === 0) return { stale: true, ageMs: Infinity };
         const lastCloseTime = klines[klines.length - 1].closeTime;
@@ -994,17 +914,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { stale: ageMs > limit, ageMs };
     }
 
-    // Returns { ok: true, closesHTF, closesLTF, volumesLTF, candlesLTF, dataQuality }
-    // on success, or { ok: false, reason, status, detail } on failure - reason is
-    // one of 'no_pair' | 'http_error' | 'network' (see fetchKlinesDetailed above).
-    // If both the 1h and 5m fetches fail for different reasons, the 1h failure
-    // reason wins (arbitrary but consistent - in practice both legs fail for the
-    // same underlying cause since they hit the same symbol/endpoint).
     async function fetchCoinCandles(coin, signal) {
         const symbol = binanceSymbolFor(coin);
         const [r1h, r5m] = await Promise.all([
-            fetchKlinesDetailed(symbol, '1h', 168, signal),  // ~7 days of hourly data (HTF)
-            fetchKlinesDetailed(symbol, '5m', 100, signal)   // ~8 hours of 5-min data (LTF)
+            fetchKlinesDetailed(symbol, '1h', 168, signal),
+            fetchKlinesDetailed(symbol, '5m', 100, signal)
         ]);
 
         if (!r1h.ok || !r5m.ok) {
@@ -1030,12 +944,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         };
     }
 
-    // Cross-checks Binance's latest close against CoinGecko's current_price
-    // for the same coin. These come from two different providers on two
-    // different polling cycles, so some divergence is normal - but a large
-    // gap is a sign one of the feeds is stale, mismatched, or the pair
-    // mapping (symbol -> USDT pair) picked the wrong market. Threshold is
-    // deliberately loose (3%) to avoid false positives on volatile alts.
     function checkPriceConsistency(coingeckoPrice, binancePrice) {
         if (!coingeckoPrice || !binancePrice) return { consistent: true, diffPct: 0 };
         const diffPct = Math.abs(coingeckoPrice - binancePrice) / coingeckoPrice * 100;
@@ -1043,23 +951,140 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // Backtest engine (Phase 6). Replays the LOCAL filter + deterministic
-    // trade-level logic (SMA / structure / OTE / SL / TP) against historical
-    // candles. This deliberately does NOT include Gemini - there's no way
-    // to retroactively ask an LLM what it would have said in the past
-    // without just making that up, so the backtest measures the part of
-    // the system that's actually reproducible: the hard technical filter.
-    // Gemini's confidence rating is not, and cannot be, backtested here -
-    // that's exactly why the card labels it "unvalidated."
-    //
-    // Limitation to be upfront about: this still assumes the fractal
-    // swing/structure read is a reasonable proxy for real ICT structure,
-    // and it can only tell you how THIS filter's rules would have performed
-    // on THIS data window - not whether ICT theory itself is sound, and not
-    // how it'll perform on data it hasn't seen yet.
+    // TWELVE DATA: forex quotes + candles
+    // Twelve Data's free tier is rate-limited (~8 requests/minute, daily
+    // cap) - every call goes through throttleTwelveData() first, same
+    // pattern as the Gemini throttle, so a scan of several pairs doesn't
+    // immediately 429.
+    // ------------------------------------------------------------------
+    const TWELVEDATA_BASE = 'https://api.twelvedata.com';
+    let currentTwelveDataRpm = 8;
+    let lastTwelveDataCallAt = 0;
+
+    async function throttleTwelveData() {
+        const minGapMs = 60000 / currentTwelveDataRpm;
+        const wait = lastTwelveDataCallAt + minGapMs - Date.now();
+        if (wait > 0) await sleep(wait);
+        lastTwelveDataCallAt = Date.now();
+    }
+
+    function forexSymbolFor(pair) {
+        // Accepts "EUR/USD" or "EURUSD" - Twelve Data wants the slash form.
+        const clean = pair.trim().toUpperCase();
+        if (clean.includes('/')) return clean;
+        if (clean.length === 6) return `${clean.slice(0, 3)}/${clean.slice(3)}`;
+        return clean;
+    }
+
+    // Twelve Data interval strings differ slightly from Binance's.
+    function twelveDataInterval(binanceStyleInterval) {
+        return binanceStyleInterval === '1h' ? '1h' : '5min';
+    }
+
+    // Detailed forex candle fetch - mirrors fetchKlinesDetailed's contract
+    // (ok/reason/status/detail) so downstream error handling can stay
+    // uniform between crypto and forex paths.
+    async function fetchForexSeriesDetailed(pair, binanceStyleInterval, outputsize, apiKey, signal) {
+        if (!apiKey) return { ok: false, reason: 'no_key', status: null, detail: 'No Twelve Data API key provided' };
+        await throttleTwelveData();
+        const symbol = forexSymbolFor(pair);
+        const interval = twelveDataInterval(binanceStyleInterval);
+        const url = `${TWELVEDATA_BASE}/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&timezone=UTC&order=ASC&apikey=${encodeURIComponent(apiKey)}`;
+        try {
+            const res = await fetchWithRetry(url, { signal });
+            if (!res.ok) {
+                const bodyText = await res.text().catch(() => '');
+                return { ok: false, reason: 'http_error', status: res.status, detail: bodyText.slice(0, 150) };
+            }
+            const data = await res.json();
+            if (data.status === 'error' || data.code >= 400) {
+                const msg = (data.message || '').toLowerCase();
+                let reason = 'api_error';
+                if (msg.includes('symbol') && (msg.includes('not found') || msg.includes('invalid'))) reason = 'no_pair';
+                if (msg.includes('run out of api credits') || msg.includes('limit')) reason = 'rate_limited';
+                return { ok: false, reason, status: data.code || null, detail: (data.message || '').slice(0, 150) };
+            }
+            const values = data.values || [];
+            const klines = values.map(v => {
+                const ts = Date.parse(v.datetime + 'Z');
+                return {
+                    openTime: ts, closeTime: ts,
+                    high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close),
+                    volume: 0
+                };
+            });
+            return { ok: true, klines };
+        } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            return { ok: false, reason: 'network', status: null, detail: err.message };
+        }
+    }
+
+    // Forex-flavored staleness check. Regular market hours use the same
+    // limits as crypto; when the market is closed, "old" data is EXPECTED
+    // (the last candle before close is simply the most recent real price),
+    // so staleness is not flagged while closed.
+    function checkForexStaleness(klines, interval) {
+        if (isForexMarketOpen()) return checkStaleness(klines, interval);
+        if (!klines || klines.length === 0) return { stale: true, ageMs: Infinity };
+        return { stale: false, ageMs: Date.now() - klines[klines.length - 1].closeTime };
+    }
+
+    async function fetchForexCandles(pair, apiKey, signal) {
+        const [r1h, r5m] = await Promise.all([
+            fetchForexSeriesDetailed(pair, '1h', 168, apiKey, signal),
+            fetchForexSeriesDetailed(pair, '5m', 100, apiKey, signal)
+        ]);
+
+        if (!r1h.ok || !r5m.ok) {
+            const failed = !r1h.ok ? r1h : r5m;
+            return { ok: false, reason: failed.reason, status: failed.status, detail: failed.detail };
+        }
+
+        const klines1h = r1h.klines, klines5m = r5m.klines;
+        const htfStale = checkForexStaleness(klines1h, '1h');
+        const ltfStale = checkForexStaleness(klines5m, '5m');
+
+        return {
+            ok: true,
+            closesHTF: klines1h.map(k => k.close),
+            closesLTF: klines5m.map(k => k.close),
+            volumesLTF: klines5m.map(k => k.volume),
+            candlesLTF: klines5m,
+            dataQuality: {
+                stale: htfStale.stale || ltfStale.stale,
+                htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
+                ltfAgeMinutes: Math.round(ltfStale.ageMs / 60000)
+            }
+        };
+    }
+
+    // Quote endpoint - used for momentum screening (percent_change) instead
+    // of CoinGecko's market-cap list, since forex has no market-cap concept.
+    async function fetchForexQuote(pair, apiKey, signal) {
+        await throttleTwelveData();
+        const symbol = forexSymbolFor(pair);
+        const url = `${TWELVEDATA_BASE}/quote?symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(apiKey)}`;
+        const res = await fetchWithRetry(url, { signal });
+        if (!res.ok) throw new Error(`Twelve Data quote error (${res.status}): ${(await res.text()).slice(0, 200)}`);
+        const data = await res.json();
+        if (data.status === 'error' || data.code >= 400) throw new Error(`Twelve Data quote error: ${data.message || 'unknown error'}`);
+        return {
+            symbol,
+            name: symbol,
+            price: parseFloat(data.close),
+            percentChange: parseFloat(data.percent_change)
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Backtest engine. Replays the LOCAL filter + deterministic trade-level
+    // logic against historical candles. Works against either crypto
+    // (Binance) or forex (Twelve Data) candles - the simulation code below
+    // only cares about closes/highs/lows/closeTime, so it's asset-agnostic;
+    // only the fetch layer above branches by market.
     // ------------------------------------------------------------------
     function getHTFSliceAsOf(htfKlines, timestamp, count) {
-        // htfKlines assumed sorted ascending by closeTime (Binance default).
         let lo = 0, hi = htfKlines.length;
         while (lo < hi) {
             const mid = (lo + hi) >> 1;
@@ -1068,13 +1093,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return htfKlines.slice(Math.max(0, lo - count), lo).map(k => k.close);
     }
 
-    // Round-trip drag from exchange fees + slippage. 0.15% approximates
-    // Binance spot taker fees plus a modest slippage allowance. Backtests
-    // that assume a perfect fill at the exact marker line and zero cost
-    // are unrealistic - this converts that flat % cost into an equivalent
-    // R deduction (relative to the trade's own risk distance) and applies
-    // it uniformly to wins, losses, and timeouts, since every trade pays
-    // the entry+exit cost regardless of how it resolves.
     const TRADING_FRICTION_PCT = 0.0015;
 
     function simulateTradeOutcome(ltfKlines, entryIndex, direction, levels, maxHoldBars) {
@@ -1092,8 +1110,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, exitIndex: j };
             }
         }
-        // Timed out before hitting either level - mark to market for a
-        // partial (possibly negative) R result rather than discarding it.
         const lastClose = ltfKlines[endIndex].close;
         const rrAchievedRaw = direction === 'bullish'
             ? (lastClose - levels.entry) / riskPerUnit
@@ -1101,16 +1117,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, exitIndex: endIndex };
     }
 
-    // Walks forward through LTF candles for one direction, only searching
-    // for a new signal once any open position has resolved (no overlapping
-    // positions in the same direction - keeps the trade count honest).
-    // When killzoneOnly is true, a bar is only eligible to trigger a NEW
-    // signal if its closeTime falls inside the London or NY kill zone
-    // (same window definitions as the live-run session banner) - bars
-    // outside a kill zone are skipped entirely for signal search, though
-    // an already-open position is still walked forward normally to its
-    // SL/TP/timeout regardless of what time it resolves at.
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly, skipVolumeCheck) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1127,7 +1134,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence, skipVolumeCheck);
                 if (filterResult.pass) {
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
                     if (levels) {
@@ -1138,7 +1145,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                             entry: levels.entry, sl: levels.sl, tp: levels.tp,
                             outcome: result.outcome, rrAchieved: result.rrAchieved
                         });
-                        i = result.exitIndex + 1; // don't search for a new signal mid-position
+                        i = result.exitIndex + 1;
                         continue;
                     }
                 }
@@ -1158,7 +1165,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const decided = wins + losses;
         const totalR = trades.reduce((sum, t) => sum + t.rrAchieved, 0);
 
-        // Max drawdown in R units, walking the equity curve in trade order.
         let equity = 0, peak = 0, maxDD = 0;
         trades.forEach(t => {
             equity += t.rrAchieved;
@@ -1175,6 +1181,23 @@ After searching, respond with ONLY this JSON object and no other text before or 
         };
     }
 
+    // Generic "fetch a symbol's 1h+5m candle history for backtesting"
+    // that branches by market type, so runBacktest / runBatchBacktest
+    // don't need to duplicate the branching logic themselves.
+    async function fetchBacktestCandlePair(symbolOrPair, marketType, signal, twelveDataKey) {
+        if (marketType === 'forex') {
+            const r1h = await fetchForexSeriesDetailed(symbolOrPair, '1h', 500, twelveDataKey, signal);
+            if (!r1h.ok) return { ok: false, reason: r1h.reason, detail: r1h.detail };
+            const r5m = await fetchForexSeriesDetailed(symbolOrPair, '5m', 1000, twelveDataKey, signal);
+            if (!r5m.ok) return { ok: false, reason: r5m.reason, detail: r5m.detail };
+            return { ok: true, klines1h: r1h.klines, klines5m: r5m.klines };
+        }
+        const klines1h = await fetchKlines(symbolOrPair, '1h', 500, signal);
+        const klines5m = await fetchKlines(symbolOrPair, '5m', 1000, signal);
+        if (!klines1h || !klines5m) return { ok: false, reason: 'no_pair', detail: 'No Binance pair or fetch failed' };
+        return { ok: true, klines1h, klines5m };
+    }
+
     async function runBacktest() {
         const btBtn = document.getElementById('backtestBtn');
         const btLog = document.getElementById('backtestLog');
@@ -1186,32 +1209,43 @@ After searching, respond with ONLY this JSON object and no other text before or 
             btLog.scrollTop = btLog.scrollHeight;
         };
 
-        const rawSymbol = document.getElementById('backtestSymbol').value.trim().toUpperCase();
-        if (!rawSymbol) { btLogFn('Enter a symbol, e.g. BTC or ETH.', 'error'); return; }
-        const symbol = rawSymbol.endsWith('USDT') ? rawSymbol : rawSymbol + 'USDT';
         const config = getConfig();
-        const maxHoldBars = 288; // 288 * 5m = 24h max hold before marking to market
+        const marketType = config.marketType;
+        const skipVolumeCheck = marketType === 'forex';
+        const twelveDataKey = document.getElementById('twelveDataKey').value.trim();
+
+        const rawSymbol = document.getElementById('backtestSymbol').value.trim();
+        if (!rawSymbol) { btLogFn(`Enter a symbol, e.g. ${marketType === 'forex' ? 'EUR/USD' : 'BTC or ETH'}.`, 'error'); return; }
+
+        let symbolOrPair;
+        if (marketType === 'forex') {
+            if (!twelveDataKey) { btLogFn('Enter your Twelve Data API key above to backtest forex pairs.', 'error'); return; }
+            symbolOrPair = forexSymbolFor(rawSymbol);
+        } else {
+            const upper = rawSymbol.toUpperCase();
+            symbolOrPair = upper.endsWith('USDT') ? upper : upper + 'USDT';
+        }
+
+        const maxHoldBars = 288;
 
         btBtn.disabled = true;
         try {
-            btLogFn(`Fetching historical data for ${symbol}...`);
+            btLogFn(`Fetching historical data for ${symbolOrPair}...`);
             const controller = new AbortController();
-            const [klines1h, klines5m] = await Promise.all([
-                fetchKlines(symbol, '1h', 500, controller.signal),   // ~20 days
-                fetchKlines(symbol, '5m', 1000, controller.signal)   // ~3.5 days
-            ]);
-            if (!klines1h || !klines5m) {
-                btLogFn(`No Binance USDT pair found for ${symbol}, or the fetch failed.`, 'error');
+            const fetched = await fetchBacktestCandlePair(symbolOrPair, marketType, controller.signal, twelveDataKey);
+            if (!fetched.ok) {
+                btLogFn(`Could not fetch history for ${symbolOrPair}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''}`, 'error');
                 return;
             }
+            const { klines1h, klines5m } = fetched;
             btLogFn(`Got ${klines1h.length} 1h candles (~${Math.round(klines1h.length / 24)} days) and ${klines5m.length} 5m candles (~${(klines5m.length * 5 / 60 / 24).toFixed(1)} days).`);
+            if (marketType === 'forex') btLogFn(`Forex mode: volume displacement check is auto-passed (no real volume data for FX).`);
             btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
-            const allStats = summarizeBacktest([...longTrades, ...shortTrades]);
 
             function fmtStats(label, s) {
                 if (s.count === 0) return `${label}: 0 signals in this window.`;
@@ -1222,11 +1256,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             btLogFn(fmtStats('LONGS', longStats), 'success');
             btLogFn(fmtStats('SHORTS', shortStats), 'success');
-            btLogFn(fmtStats('COMBINED', allStats), 'success');
-            btLogFn('\nRemember: this is one symbol, one recent data window (limited by how much history Binance\'s free klines endpoint returns), and it excludes Gemini entirely. Small sample sizes here are NOT a reliable estimate of edge - re-run across multiple symbols and time windows before drawing conclusions.', 'error');
+            btLogFn('\nRemember: this is one symbol, one recent data window, and it excludes Gemini entirely. Small sample sizes here are NOT a reliable estimate of edge - re-run across multiple symbols and time windows before drawing conclusions.', 'error');
 
             btResults.innerHTML = `
-                <div class="row"><strong>${symbol} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''})</strong></div>
+                <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''})</strong></div>
                 <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
                 <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
             `;
@@ -1237,21 +1270,16 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
     }
 
-    // ------------------------------------------------------------------
-    // Batch Backtest / RR Sweep (Phase 8). Answers two problems with the
-    // single-symbol backtest above: (1) one symbol over a few days of 5m
-    // data is too small a sample to trust, and (2) comparing RR values
-    // required manually re-running the whole backtest and eyeballing the
-    // difference. This fetches candles for every listed symbol ONCE, then
-    // replays every listed RR value against those same fetched candles -
-    // so the comparison across RR values is apples-to-apples (same entries,
-    // same market data), and the sample size is the SUM of signals across
-    // every symbol instead of whatever one coin happened to produce.
-    // ------------------------------------------------------------------
     function parseSymbolList(raw) {
         return Array.from(new Set(
             raw.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
                 .map(s => s.endsWith('USDT') ? s : s + 'USDT')
+        ));
+    }
+
+    function parsePairList(raw) {
+        return Array.from(new Set(
+            raw.split(',').map(s => forexSymbolFor(s)).filter(Boolean)
         ));
     }
 
@@ -1272,14 +1300,21 @@ After searching, respond with ONLY this JSON object and no other text before or 
             logEl.scrollTop = logEl.scrollHeight;
         };
 
-        const symbols = parseSymbolList(document.getElementById('batchSymbols').value);
+        const config = getConfig();
+        const marketType = config.marketType;
+        const skipVolumeCheck = marketType === 'forex';
+        const twelveDataKey = document.getElementById('twelveDataKey').value.trim();
+
+        const symbols = marketType === 'forex'
+            ? parsePairList(document.getElementById('batchSymbols').value)
+            : parseSymbolList(document.getElementById('batchSymbols').value);
         const rrValues = parseRRList(document.getElementById('batchRRValues').value);
 
         if (symbols.length === 0) { blog('Enter at least one symbol.', 'error'); return; }
         if (rrValues.length === 0) { blog('Enter at least one valid RR value.', 'error'); return; }
+        if (marketType === 'forex' && !twelveDataKey) { blog('Enter your Twelve Data API key above to batch-backtest forex pairs.', 'error'); return; }
 
-        const config = getConfig();
-        const maxHoldBars = 288; // 24h max hold, same as single backtest
+        const maxHoldBars = 288;
 
         btn.disabled = true;
         try {
@@ -1288,17 +1323,14 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const symbolData = [];
 
             for (const symbol of symbols) {
-                const [klines1h, klines5m] = await Promise.all([
-                    fetchKlines(symbol, '1h', 500, controller.signal),   // ~20 days
-                    fetchKlines(symbol, '5m', 1000, controller.signal)   // ~3.5 days
-                ]);
-                if (!klines1h || !klines5m) {
-                    blog(`${symbol}: no Binance pair or fetch failed - skipped.`, 'error');
+                const fetched = await fetchBacktestCandlePair(symbol, marketType, controller.signal, twelveDataKey);
+                if (!fetched.ok) {
+                    blog(`${symbol}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''} - skipped.`, 'error');
                     continue;
                 }
-                symbolData.push({ symbol, klines1h, klines5m });
-                blog(`${symbol}: got ${klines1h.length} 1h / ${klines5m.length} 5m candles.`);
-                await sleep(200); // courtesy delay across sequential Binance requests
+                symbolData.push({ symbol, klines1h: fetched.klines1h, klines5m: fetched.klines5m });
+                blog(`${symbol}: got ${fetched.klines1h.length} 1h / ${fetched.klines5m.length} 5m candles.`);
+                await sleep(marketType === 'forex' ? 400 : 200);
             }
 
             if (symbolData.length === 0) {
@@ -1309,17 +1341,15 @@ After searching, respond with ONLY this JSON object and no other text before or 
             blog(`\nTesting ${rrValues.length} RR value(s) across ${symbolData.length} symbol(s)`
                 + `${config.strictConfluence ? ' | STRICT confluence ON' : ' | strict confluence OFF'}`
                 + `${config.killzoneOnly ? ' | KILL ZONE ONLY ON' : ' | kill zone restriction OFF'}`
+                + `${marketType === 'forex' ? ' | volume check auto-passed (forex)' : ''}`
                 + ` (settings taken from the Settings panel above)...\n`);
 
-            // Same fetched candles are reused for every RR value - entry logic
-            // and structure don't change with RR, only where TP is placed, so
-            // this is a fair apples-to-apples comparison across RR values.
             const rrResults = rrValues.map(rr => {
                 let allTrades = [];
                 let longCount = 0, shortCount = 0;
                 symbolData.forEach(({ klines1h, klines5m }) => {
-                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly);
-                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly);
+                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
+                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
                     longCount += longTrades.length;
                     shortCount += shortTrades.length;
                     allTrades = allTrades.concat(longTrades, shortTrades);
@@ -1371,7 +1401,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             const lowSampleRows = rrResults.filter(r => r.stats.count > 0 && r.stats.count < 20);
             if (lowSampleRows.length > 0) {
-                blog(`\nSample size note: ${lowSampleRows.map(r => `RR ${r.rr} (${r.stats.count} signals)`).join(', ')} still have under ~20 signals - treat those rows as directional, not conclusive. RR rows with more signals are more trustworthy. This is still limited by how far back Binance's free klines endpoint goes (~3.5 days of 5m data), so re-run periodically as more history accumulates, or widen the symbol list further.`, 'error');
+                blog(`\nSample size note: ${lowSampleRows.map(r => `RR ${r.rr} (${r.stats.count} signals)`).join(', ')} still have under ~20 signals - treat those rows as directional, not conclusive.`, 'error');
             }
         } catch (e) {
             blog(`Batch backtest error: ${e.message}`, 'error');
@@ -1382,17 +1412,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     // ------------------------------------------------------------------
     // Auto-journal (persisted trade log with later outcome checking).
-    // Every trade a live run recommends gets saved locally as "pending."
-    // "Check Outcomes" later fetches the ACTUAL 5m candles that happened
-    // since each trade was logged (not a simulation) and walks them to see
-    // whether price touched SL or TP first, same win/loss logic as the
-    // backtest engine but against real forward data. This is the only
-    // trustworthy record of how live recommendations actually did - the
-    // cards themselves are not proof of anything until checked here.
     // ------------------------------------------------------------------
     const JOURNAL_KEY = 'ictSniper_journal';
     const JOURNAL_MAX_ENTRIES = 300;
-    const JOURNAL_MAX_HOLD_MS = 48 * 60 * 60 * 1000; // mark-to-market if untouched after 48h
+    const JOURNAL_MAX_HOLD_MS = 48 * 60 * 60 * 1000;
 
     function loadJournal() {
         try {
@@ -1406,9 +1429,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal.slice(-JOURNAL_MAX_ENTRIES)));
         } catch (e) {
             console.warn('Journal storage quota hit - shedding oldest entries to keep new signals saving.', e);
-            // QuotaExceededError or similar - aggressively drop the oldest
-            // 20% and retry once rather than silently losing the newest
-            // live signal, which is the one the user actually needs.
             if (journal.length > 20) {
                 const trimmed = journal.slice(Math.floor(journal.length * 0.20));
                 try {
@@ -1422,13 +1442,13 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
     }
 
-    // Called automatically for every successful trade card a live run produces.
     function logTradeToJournal(trade) {
         const journal = loadJournal();
         journal.push({
             id: `${trade.symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             symbol: trade.symbol,
-            direction: trade.direction, // 'Long' or 'Short'
+            marketType: trade.marketType || 'crypto',
+            direction: trade.direction,
             entry: parseFloat(trade.entry),
             sl: parseFloat(trade.sl),
             tp: parseFloat(trade.tp),
@@ -1498,7 +1518,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const orderText = e.orderType
                 ? `${e.orderType.toUpperCase()}${e.currentPrice !== null ? ` (price at signal: $${e.currentPrice})` : ''}`
                 : 'Not recorded for this entry.';
-            const volText = (e.volumeRatio !== null && e.volumeRatio !== undefined) ? `${e.volumeRatio.toFixed(2)}x 20-bar avg` : 'n/a';
+            const volText = (e.volumeRatio !== null && e.volumeRatio !== undefined) ? `${e.volumeRatio.toFixed(2)}x 20-bar avg` : (e.marketType === 'forex' ? 'n/a (forex - no volume data)' : 'n/a');
             const confluenceText = (e.sweepConfirmed !== null && e.sweepConfirmed !== undefined)
                 ? `Sweep: ${e.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${e.fvgConfluence ? 'yes' : 'no'}`
                 : 'Not recorded for this entry.';
@@ -1509,7 +1529,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     : `Extension below floor - flat floor RR used${e.extensionRatioUsed ? ` (extension was ${(e.extensionRatioUsed * 100).toFixed(1)}%)` : ''}`;
             return `
                 <details class="row" style="background:#fafafa; border-radius:4px; padding:4px 8px; margin-bottom:4px;">
-                    <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
+                    <summary style="cursor:pointer;"><span class="${cls}">[${e.status.toUpperCase()}]</span> ${e.marketType === 'forex' ? '[FX] ' : ''}${new Date(e.loggedAt).toLocaleString()} - ${e.symbol} ${e.direction} @ ${e.entry} (SL ${e.sl} / TP ${e.tp}) - ${rrText}</summary>
                     <div class="row" style="margin-top:6px;">Entry: $${e.entry} | SL: $${e.sl} | TP: $${e.tp} | RR: ${(typeof e.rr === 'number' ? e.rr.toFixed(2) : e.rr)}:1</div>
                     <div class="row">TP mode: ${tpModeText}</div>
                     <div class="row">Order type: ${orderText}</div>
@@ -1538,17 +1558,27 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const pending = journal.filter(e => e.status === 'pending');
         if (pending.length === 0) { jlog('No pending trades to check.'); return; }
 
+        const twelveDataKey = document.getElementById('twelveDataKey').value.trim();
         btn.disabled = true;
         const controller = new AbortController();
         try {
             jlog(`Checking ${pending.length} pending trade(s) against actual price history since they were logged...`);
             for (const entry of pending) {
-                const symbol = entry.symbol.endsWith('USDT') ? entry.symbol : entry.symbol + 'USDT';
+                const isForex = entry.marketType === 'forex';
                 const msSince = Date.now() - entry.loggedAt;
                 const barsSince = Math.min(1000, Math.ceil(msSince / (5 * 60 * 1000)) + 2);
                 if (barsSince < 1) { jlog(`${entry.symbol}: too recent to check yet.`); continue; }
 
-                const klines = await fetchKlines(symbol, '5m', barsSince, controller.signal, entry.loggedAt);
+                let klines;
+                if (isForex) {
+                    if (!twelveDataKey) { jlog(`${entry.symbol}: needs a Twelve Data API key to check - skipping.`, 'error'); continue; }
+                    const r = await fetchForexSeriesDetailed(entry.symbol, '5m', barsSince, twelveDataKey, controller.signal);
+                    if (!r.ok) { jlog(`${entry.symbol}: ${r.reason}${r.detail ? ' - ' + r.detail : ''} - skipping.`, 'error'); continue; }
+                    klines = r.klines.filter(k => k.closeTime >= entry.loggedAt);
+                } else {
+                    const symbol = entry.symbol.endsWith('USDT') ? entry.symbol : entry.symbol + 'USDT';
+                    klines = await fetchKlines(symbol, '5m', barsSince, controller.signal, entry.loggedAt);
+                }
                 if (!klines || klines.length === 0) {
                     jlog(`${entry.symbol}: no candle data since it was logged - skipping.`, 'error');
                     continue;
@@ -1579,7 +1609,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 } else {
                     jlog(`${entry.symbol} ${entry.direction}: still pending - no TP/SL touch yet.`);
                 }
-                await sleep(250);
+                await sleep(isForex ? 400 : 250);
             }
             saveJournal(journal);
             jlog('\nDone.', 'success');
@@ -1600,12 +1630,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
-    // Rolling daily circuit breaker. If the journal shows a net realized
-    // loss greater than 3% of account balance within a trailing 24-hour
-    // window, new order entries are blocked for a full 24 hours from the
-    // moment the breach is detected - this is a hard stop meant to save
-    // capital when the market regime shifts from clean trends into chop,
-    // regardless of how confident any individual signal looks.
+    // Rolling daily circuit breaker. Asset-agnostic - it just looks at
+    // realized $ P/L across the journal regardless of whether entries are
+    // crypto or forex, so it protects the account as a whole.
     // ------------------------------------------------------------------
     const CIRCUIT_BREAKER_KEY = 'ictSniper_circuitBreaker';
     const CIRCUIT_BREAKER_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -1625,11 +1652,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         } catch (e) { console.error('Circuit breaker save failed:', e); }
     }
 
-    // Sums realized $ P/L (rrAchieved * riskAmount) for journal entries
-    // resolved within the trailing window. Only entries with a recorded
-    // riskAmount are counted - older entries logged before position sizing
-    // was tracked can't be priced in $ terms and are skipped rather than
-    // guessed at.
     function getRollingPnL(journal, windowMs) {
         const cutoff = Date.now() - windowMs;
         return journal
@@ -1637,8 +1659,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             .reduce((sum, e) => sum + (e.rrAchieved * e.riskAmount), 0);
     }
 
-    // Checks (and if needed, arms) the breaker. Returns { blocked, message }.
-    // Call this at the start of every run, before any API calls are made.
     function checkCircuitBreaker(config) {
         const existing = loadBreakerState();
         const now = Date.now();
@@ -1652,8 +1672,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
             };
         }
 
-        // Breaker expired or never armed - clear stale state and re-check
-        // the rolling loss against the current journal.
         if (existing) saveBreakerState(null);
 
         const journal = loadJournal();
@@ -1691,9 +1709,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,tpMode,extensionRatioUsed,notes\n';
+        const header = 'id,marketType,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,tpMode,extensionRatioUsed,notes\n';
         const rows = journal.map(e => [
-            e.id, new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
+            e.id, e.marketType || 'crypto', new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
             e.rrAchieved !== null ? e.rrAchieved.toFixed(4) : '',
             e.units !== undefined ? e.units : '', e.positionUSD !== undefined ? e.positionUSD : '',
@@ -1714,9 +1732,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         URL.revokeObjectURL(url);
     }
 
-    // Minimal CSV line parser - handles quoted fields containing commas and
-    // escaped double-quotes (which is all exportJournalCSV ever produces,
-    // but written defensively in case the file was hand-edited).
     function parseCSVLine(line) {
         const fields = [];
         let cur = '', inQuotes = false;
@@ -1736,10 +1751,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fields;
     }
 
-    // ------------------------------------------------------------------
-    // PATCHED import: forces all imported entries to "pending" with null rrAchieved,
-    // so they are never trusted as wins without re-checking against live data.
-    // ------------------------------------------------------------------
     function importJournalCSV(event) {
         const file = event.target.files[0];
         if (!file) return;
@@ -1767,6 +1778,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     return {
                         id: hasId && get('id') ? get('id') : `${get('symbol')}-${Date.parse(loggedAtStr)}-${get('entry')}`,
                         symbol: get('symbol'),
+                        marketType: get('marketType') || 'crypto',
                         direction: get('direction'),
                         entry: parseFloat(get('entry')),
                         sl: parseFloat(get('sl')),
@@ -1786,7 +1798,6 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         tpMode: get('tpMode') || null,
                         extensionRatioUsed: numOrUndefined('extensionRatioUsed') ?? null,
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
-                        // Force all imported entries to pending, with no resolved outcome.
                         status: 'pending',
                         resolvedAt: null,
                         rrAchieved: null
@@ -1803,14 +1814,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         byId.set(imp.id, imp);
                         added++;
                     } else {
-                        // If the imported entry already exists locally, replace it with the forced-pending one
-                        // only if the local one is also pending (so we don't overwrite a manually resolved outcome).
-                        // If the local one is already resolved (win/loss/expired), we keep it to preserve the verified result.
                         if (match.status === 'pending') {
                             byId.set(imp.id, imp);
                             updated++;
                         }
-                        // else: local is resolved, so we ignore the imported version.
                     }
                 });
 
@@ -1821,15 +1828,18 @@ After searching, respond with ONLY this JSON object and no other text before or 
             } catch (e) {
                 alert(`Could not import CSV: ${e.message}`);
             } finally {
-                event.target.value = ''; // allow re-selecting the same file later
+                event.target.value = '';
             }
         };
         reader.readAsText(file);
     }
 
     // ------------------------------------------------------------------
-    // Prompt construction - Gemini only judges context/session quality now;
-    // it does not compute or invent entry/SL/TP/RR (Phase 2.3).
+    // Prompt construction - Gemini only judges context/session quality;
+    // it does not compute or invent entry/SL/TP/RR. Generic across asset
+    // classes: `coin` just needs .name and .symbol, and `assetLabel` swaps
+    // the wording for the news-search prompt ("cryptocurrency" vs
+    // "currency pair").
     // ------------------------------------------------------------------
     function buildPrompt(coin, direction, currentPrice, filterResult, sessionInfo, change24h) {
         const dirLabel = direction === 'bullish' ? 'long' : 'short';
@@ -1838,15 +1848,15 @@ After searching, respond with ONLY this JSON object and no other text before or 
 The following technical facts have already been computed and verified in code - treat them as ground truth, do not recompute them:
 
 Symbol: ${coin.symbol.toUpperCase()}
-Current Price: $${currentPrice}
+Current Price: ${currentPrice}
 24h Change: ${change24h}%
-20-period MA (1h): $${filterResult.sma.toFixed(6)} (price is ${direction === 'bullish' ? 'above' : 'below'} it)
+20-period MA (1h): ${filterResult.sma.toFixed(6)} (price is ${direction === 'bullish' ? 'above' : 'below'} it)
 HTF structure: confirmed ${structureLabel} over the recent lookback window
-Recent swing high: $${filterResult.swing.high}
-Recent swing low: $${filterResult.swing.low}
+Recent swing high: ${filterResult.swing.high}
+Recent swing low: ${filterResult.swing.low}
 Price is currently inside the 61.8%-78.6% Fibonacci OTE retracement zone of that swing
-Liquidity sweep: ${filterResult.sweep && filterResult.sweep.swept ? `CONFIRMED - price wicked through a prior swing point at $${filterResult.sweep.level} and closed back through it (stop hunt pattern)` : 'not confirmed in the recent lookback window'}
-Fair Value Gap confluence: ${filterResult.fvgMatch ? `price is sitting inside an unmitigated FVG ($${filterResult.fvgMatch.bottom.toFixed(6)}-$${filterResult.fvgMatch.top.toFixed(6)})` : 'no FVG currently overlapping price'}
+Liquidity sweep: ${filterResult.sweep && filterResult.sweep.swept ? `CONFIRMED - price wicked through a prior swing point at ${filterResult.sweep.level} and closed back through it (stop hunt pattern)` : 'not confirmed in the recent lookback window'}
+Fair Value Gap confluence: ${filterResult.fvgMatch ? `price is sitting inside an unmitigated FVG (${filterResult.fvgMatch.bottom.toFixed(6)}-${filterResult.fvgMatch.top.toFixed(6)})` : 'no FVG currently overlapping price'}
 Session: ${sessionInfo.summary}
 
 Your job is ONLY to judge context and confidence - not to invent price levels:
@@ -1898,13 +1908,16 @@ Respond ONLY with valid JSON, no extra text:
         const badgeColor = trade.orderType === 'market' ? '#28a745' : '#f5a623';
         const badgeText = trade.orderType === 'market' ? 'MARKET ORDER' : 'LIMIT ORDER';
         const detail = trade.orderType === 'market'
-            ? `Price is already at (or past) the 70.5% OTE sweet spot - enter at current market price (~$${trade.currentPrice}).`
-            : `Price hasn't retraced to the 70.5% OTE sweet spot yet (currently ~$${trade.currentPrice}, ${trade.distancePct !== undefined ? trade.distancePct.toFixed(2) : '?'}% away). Place a resting limit order at $${trade.entry} instead of chasing.`;
-        return `<div class="row"><strong style="color:${badgeColor}">[${badgeText}]</strong> ${trade.orderLabel || ''} @ $${trade.entry}</div>
+            ? `Price is already at (or past) the 70.5% OTE sweet spot - enter at current market price (~${trade.currentPrice}).`
+            : `Price hasn't retraced to the 70.5% OTE sweet spot yet (currently ~${trade.currentPrice}, ${trade.distancePct !== undefined ? trade.distancePct.toFixed(2) : '?'}% away). Place a resting limit order at ${trade.entry} instead of chasing.`;
+        return `<div class="row"><strong style="color:${badgeColor}">[${badgeText}]</strong> ${trade.orderLabel || ''} @ ${trade.entry}</div>
                 <div class="row muted">${detail}</div>`;
     }
 
     function renderVolumeSection(trade) {
+        if (trade.marketType === 'forex') {
+            return `<div class="row muted">Volume displacement: n/a - forex has no centralized volume feed, so this check is auto-passed.</div>`;
+        }
         if (trade.volumeRatio === null || trade.volumeRatio === undefined) return '';
         return `<div class="row muted">Volume displacement: ${trade.volumeRatio.toFixed(2)}x the 20-bar average (institutional threshold: ${VOLUME_DISPLACEMENT_RATIO}x)</div>`;
     }
@@ -1912,10 +1925,10 @@ Respond ONLY with valid JSON, no extra text:
     function renderConfluenceSection(trade) {
         if (trade.sweepConfirmed === undefined && trade.fvgConfluence === undefined) return '';
         const sweepText = trade.sweepConfirmed
-            ? `<span class="success">Liquidity sweep: confirmed</span>${trade.sweepLevel !== null ? ` (swept prior level ~$${trade.sweepLevel})` : ''}`
+            ? `<span class="success">Liquidity sweep: confirmed</span>${trade.sweepLevel !== null ? ` (swept prior level ~${trade.sweepLevel})` : ''}`
             : `<span class="muted">Liquidity sweep: not confirmed</span>`;
         const fvgText = trade.fvgConfluence
-            ? `<span class="success">FVG confluence: yes</span>${trade.fvgRange ? ` ($${trade.fvgRange.bottom.toFixed(6)}-$${trade.fvgRange.top.toFixed(6)})` : ''}`
+            ? `<span class="success">FVG confluence: yes</span>${trade.fvgRange ? ` (${trade.fvgRange.bottom.toFixed(6)}-${trade.fvgRange.top.toFixed(6)})` : ''}`
             : `<span class="muted">FVG confluence: no</span>`;
         return `<div class="row">${sweepText} | ${fvgText}</div>`;
     }
@@ -1938,9 +1951,9 @@ Respond ONLY with valid JSON, no extra text:
         const div = document.createElement('div');
         div.className = `card ${cls}`;
         div.innerHTML = `
-            <h3>${trade.name} (${trade.symbol}) - ${trade.direction}</h3>
+            <h3>${trade.name} (${trade.symbol})${trade.marketType === 'forex' ? ' [FX]' : ''} - ${trade.direction}</h3>
             ${renderOrderTypeSection(trade)}
-            <div class="row">Entry: $${trade.entry} | SL: $${trade.sl} | TP: $${trade.tp} | RR: ${(typeof trade.rr === 'number' ? trade.rr.toFixed(2) : trade.rr)}:1</div>
+            <div class="row">Entry: ${trade.entry} | SL: ${trade.sl} | TP: ${trade.tp} | RR: ${(typeof trade.rr === 'number' ? trade.rr.toFixed(2) : trade.rr)}:1</div>
             ${renderTPModeSection(trade)}
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence} - this is Gemini's qualitative judgment, not a measured signal. See Backtest tab for actual historical hit rates of the local filter.</div>
@@ -1953,11 +1966,6 @@ Respond ONLY with valid JSON, no extra text:
         cards.appendChild(div);
     }
 
-    // Re-sorts the rendered cards (and the underlying lastValidTrades
-    // arrays) by volume ratio, strongest institutional displacement first.
-    // Called once after a run completes so that when several setups
-    // trigger in the same scan, the ones most likely to be real
-    // displacement (rather than low-liquidity drift) are surfaced first.
     function rankAndRerenderCards() {
         const byVolumeDesc = (a, b) => (b.volumeRatio || 0) - (a.volumeRatio || 0);
         lastValidTrades.longs.sort(byVolumeDesc);
@@ -1983,8 +1991,8 @@ Respond ONLY with valid JSON, no extra text:
         const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
         if (all.length === 0) return 'No valid trades found this run.';
         all.forEach((t, i) => {
-            const orderTag = t.orderType ? `${t.orderType.toUpperCase()} @ $${t.entry}` : `Entry: $${t.entry}`;
-            lines.push(`${i + 1}. ${t.direction} ${t.symbol} | ${orderTag} | SL: $${t.sl} | TP: $${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Vol: ${t.volumeRatio ? t.volumeRatio.toFixed(2) + 'x' : 'n/a'} | ${t.notes}`);
+            const orderTag = t.orderType ? `${t.orderType.toUpperCase()} @ ${t.entry}` : `Entry: ${t.entry}`;
+            lines.push(`${i + 1}. ${t.direction} ${t.symbol}${t.marketType === 'forex' ? ' [FX]' : ''} | ${orderTag} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Vol: ${t.volumeRatio ? t.volumeRatio.toFixed(2) + 'x' : 'n/a'} | ${t.notes}`);
         });
         return lines.join('\n');
     }
@@ -1998,7 +2006,7 @@ Respond ONLY with valid JSON, no extra text:
     }
 
     // ------------------------------------------------------------------
-    // Per-candidate analysis
+    // Per-candidate analysis - CRYPTO
     // ------------------------------------------------------------------
     async function analyzeCandidate(coin, direction, config, sessionInfo, apiKey, signal) {
         const symbol = coin.symbol.toUpperCase();
@@ -2021,10 +2029,6 @@ Respond ONLY with valid JSON, no extra text:
         if (candles.closesHTF.length < 24) return { success: false, reason: 'Insufficient 1h candle history' };
         if (candles.closesLTF.length < 20) return { success: false, reason: 'Insufficient 5m candle history' };
 
-        // Hard stop on stale data - do NOT proceed to render a card off a
-        // feed that might be frozen/cached. This is the fix for "nothing
-        // in the app would tell you the signal is bad": we now check, and
-        // we refuse to produce a signal rather than silently trusting it.
         if (candles.dataQuality.stale) {
             return {
                 success: false,
@@ -2042,15 +2046,9 @@ Respond ONLY with valid JSON, no extra text:
             };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, false);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
-        // Decide whether this is a "buy/sell now" (market) or "wait for a
-        // better price" (limit) setup. The local filter only confirms price
-        // is somewhere in the 61.8-78.6% OTE band; this pinpoints whether
-        // it's already at the 70.5% sweet spot or still needs to retrace
-        // further, and computes trade levels off whichever price the user
-        // will actually be filled at.
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
         const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
 
@@ -2071,15 +2069,9 @@ Respond ONLY with valid JSON, no extra text:
         if (validationError) return { success: false, reason: `Gemini response invalid: ${validationError}` };
         if (!analysis.valid) return { success: false, reason: `Gemini: ${analysis.notes || 'context did not support setup'}` };
 
-        // News check - only runs for candidates that already survived the
-        // technical filter AND Gemini's context read, to avoid burning
-        // search-grounded calls on setups that would be discarded anyway.
-        // A failed/errored news check does NOT kill the trade (news search
-        // is a bonus signal, not a hard requirement) - it's just flagged as
-        // unchecked so you know to verify manually.
         let newsCheck = null;
         try {
-            newsCheck = await checkCoinNews(coin, direction, apiKey, signal);
+            newsCheck = await checkCoinNews({ name: coin.name, symbol: coin.symbol }, direction, apiKey, signal);
             if (newsCheck.riskLevel === 'high' && newsCheck.conflictsWithDirection) {
                 return {
                     success: false,
@@ -2096,6 +2088,7 @@ Respond ONLY with valid JSON, no extra text:
         return {
             success: true,
             trade: {
+                marketType: 'crypto',
                 name: coin.name,
                 symbol,
                 entry: levels.entry.toFixed(6),
@@ -2126,12 +2119,142 @@ Respond ONLY with valid JSON, no extra text:
     }
 
     // ------------------------------------------------------------------
-    // Main run
+    // Per-candidate analysis - FOREX
+    // Mirrors analyzeCandidate above almost exactly - same local filter,
+    // same adaptive TP logic, same Gemini context + news calls - the only
+    // real differences are: candles come from Twelve Data instead of
+    // Binance, there's no market-cap "coin" object (just a pair string),
+    // the volume displacement gate is skipped (skipVolumeCheck=true), and
+    // position sizing risk is expressed in account-currency terms per unit
+    // of the quote currency rather than crypto "units" (functionally the
+    // same math either way - riskAmount / riskPerUnit).
+    // ------------------------------------------------------------------
+    async function analyzeForexCandidate(pair, direction, config, sessionInfo, geminiKey, twelveDataKey, quoteInfo, signal) {
+        const symbol = forexSymbolFor(pair);
+        const change24h = quoteInfo.percentChange.toFixed(2);
+        const coinLike = { name: symbol, symbol: symbol.replace('/', '') };
+
+        if (Math.abs(quoteInfo.percentChange) > 15) {
+            return { success: false, reason: 'Extreme daily move (>15%) for a forex pair - likely a data anomaly, skipped as a precaution' };
+        }
+
+        const candles = await fetchForexCandles(symbol, twelveDataKey, signal);
+        if (!candles.ok) {
+            const reasonMessages = {
+                no_pair: `Twelve Data does not recognize ${symbol} as a symbol`,
+                no_key: 'No Twelve Data API key provided',
+                rate_limited: 'Twelve Data API credit/rate limit reached for this key - lower Twelve Data requests/minute or wait for the quota to reset',
+                api_error: `Twelve Data API error${candles.detail ? ` - ${candles.detail}` : ''}`,
+                http_error: `Twelve Data HTTP error${candles.status ? ` (${candles.status})` : ''}${candles.detail ? ` - ${candles.detail}` : ''}`,
+                network: `Network error reaching Twelve Data${candles.detail ? ` (${candles.detail})` : ''}`
+            };
+            return { success: false, reason: reasonMessages[candles.reason] || 'Candle fetch failed for an unrecognized reason' };
+        }
+
+        if (candles.closesHTF.length < 24) return { success: false, reason: 'Insufficient 1h candle history' };
+        if (candles.closesLTF.length < 20) return { success: false, reason: 'Insufficient 5m candle history' };
+
+        if (candles.dataQuality.stale) {
+            return {
+                success: false,
+                reason: `Stale data - skipped for safety (1h feed ${candles.dataQuality.htfAgeMinutes}m old, 5m feed ${candles.dataQuality.ltfAgeMinutes}m old)`
+            };
+        }
+
+        const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
+
+        const priceCheck = checkPriceConsistency(quoteInfo.price, currentPrice);
+        if (!priceCheck.consistent) {
+            return {
+                success: false,
+                reason: `Twelve Data quote/candle price mismatch (${priceCheck.diffPct.toFixed(1)}%) - possible stale feed, skipped for safety`
+            };
+        }
+
+        // skipVolumeCheck = true: forex has no centralized volume feed.
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, true);
+        if (!filterResult.pass) return { success: false, reason: filterResult.reason };
+
+        const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
+        const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
+
+        const levels = computeAdaptiveTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config);
+        if (!levels) return { success: false, reason: 'Computed risk distance was zero/invalid - skipped' };
+
+        const priceDecimals = currentPrice < 10 ? 5 : 3; // JPY-style pairs quote to ~3dp, most others to ~5dp
+        const prompt = buildPrompt(coinLike, direction, currentPrice.toFixed(priceDecimals), filterResult, sessionInfo, change24h);
+
+        let analysis;
+        try {
+            analysis = await callGeminiJSON(prompt, geminiKey, signal);
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            return { success: false, reason: `Gemini error: ${e.message}` };
+        }
+
+        const validationError = validateGeminiAnalysis(analysis);
+        if (validationError) return { success: false, reason: `Gemini response invalid: ${validationError}` };
+        if (!analysis.valid) return { success: false, reason: `Gemini: ${analysis.notes || 'context did not support setup'}` };
+
+        let newsCheck = null;
+        try {
+            newsCheck = await checkCoinNews({ name: `${symbol} currency pair`, symbol: coinLike.symbol }, direction, geminiKey, signal);
+            if (newsCheck.riskLevel === 'high' && newsCheck.conflictsWithDirection) {
+                return {
+                    success: false,
+                    reason: `News check: HIGH risk, conflicts with ${direction === 'bullish' ? 'long' : 'short'} direction - ${newsCheck.summary}`
+                };
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            newsCheck = { newsFound: false, riskLevel: 'unchecked', summary: `News check failed: ${e.message} - verify manually before trading.`, conflictsWithDirection: false, sources: [] };
+        }
+
+        const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
+
+        return {
+            success: true,
+            trade: {
+                marketType: 'forex',
+                name: symbol,
+                symbol,
+                entry: levels.entry.toFixed(priceDecimals),
+                sl: levels.sl.toFixed(priceDecimals),
+                tp: levels.tp.toFixed(priceDecimals),
+                rr: levels.rr,
+                units: sizing.units.toFixed(2),
+                positionUSD: sizing.positionUSD.toFixed(2),
+                riskAmount: sizing.riskAmount.toFixed(2),
+                confidence: analysis.confidence,
+                notes: `${analysis.notes} | 24h: ${change24h}%`,
+                direction: direction === 'bullish' ? 'Long' : 'Short',
+                dataAgeMinutes: Math.max(candles.dataQuality.htfAgeMinutes, candles.dataQuality.ltfAgeMinutes),
+                newsCheck,
+                orderType: orderInfo.type,
+                orderLabel: orderInfo.orderLabel,
+                currentPrice: currentPrice.toFixed(priceDecimals),
+                distancePct: orderInfo.distancePct,
+                volumeRatio: null,
+                sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
+                sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
+                fvgConfluence: !!filterResult.fvgMatch,
+                fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
+                tpMode: levels.tpMode,
+                extensionRatioUsed: levels.extensionRatio || null
+            }
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Main run - branches on config.marketType at the candidate-building
+    // stage; the per-candidate loop, journal logging, ranking, and trade
+    // plan rendering below are shared between both markets.
     // ------------------------------------------------------------------
     async function runAnalysis() {
         if (isRunning) return;
 
         const apiKey = document.getElementById('geminiKey').value.trim();
+        const twelveDataKey = document.getElementById('twelveDataKey').value.trim();
         document.getElementById('log').innerHTML = '';
         document.getElementById('cards').innerHTML = '';
         document.getElementById('copyBtn').style.display = 'none';
@@ -2145,6 +2268,12 @@ Respond ONLY with valid JSON, no extra text:
         saveConfig();
         const config = getConfig();
         currentGeminiRpm = config.geminiRpm;
+        currentTwelveDataRpm = config.twelveDataRpm;
+
+        if (config.marketType === 'forex' && !twelveDataKey) {
+            log('Please enter your Twelve Data API key to scan forex pairs!', 'error');
+            return;
+        }
 
         const breaker = checkCircuitBreaker(config);
         renderCircuitBreakerStatus();
@@ -2154,15 +2283,17 @@ Respond ONLY with valid JSON, no extra text:
             return;
         }
 
+        if (config.marketType === 'forex') {
+            const closedMsg = forexMarketStatusMessage(config.displayTimezone);
+            if (closedMsg) {
+                log(closedMsg, 'error');
+                log('This is a market-hours gate, not stale data - candles simply stop moving while forex is closed.', 'error');
+                return;
+            }
+        }
+
         const sessionInfo = getSessionInfo(config.displayTimezone);
 
-        // Kill-zone-only gate for live runs. Unlike the backtest (which can
-        // selectively skip individual historical bars), a live run only has
-        // "now" to work with - so when this setting is on and we're
-        // currently outside London/NY session windows, the whole run is
-        // paused rather than silently scanning off-session and producing
-        // signals the user asked NOT to see. This mirrors the circuit
-        // breaker's block-and-explain pattern.
         if (config.killzoneOnly && !sessionInfo.inKillZone) {
             log(sessionInfo.summary);
             log('Kill zone only is ON in Settings, and the current time is outside both the London and New York kill zones - run blocked.', 'error');
@@ -2183,44 +2314,67 @@ Respond ONLY with valid JSON, no extra text:
             log('Validating Gemini API key...');
             const keyOk = await testGeminiKey(apiKey, currentController.signal);
             if (!keyOk) {
-                log('Gemini API key appears invalid or has no quota. Stopping before using any CoinGecko calls.', 'error');
+                log('Gemini API key appears invalid or has no quota. Stopping before using any market-data calls.', 'error');
                 return;
             }
             log('Gemini key OK.', 'success');
 
             log(sessionInfo.summary);
             if (config.killzoneOnly) log('Kill zone only is ON - this run is proceeding because current time is inside a kill zone.', 'success');
+            if (config.marketType === 'forex') log('Forex mode: volume displacement check auto-passes (no centralized FX volume feed).', 'success');
 
-            log('Fetching top 50 markets from CoinGecko...');
-            const topCryptos = await fetchTopMarkets(currentController.signal);
+            let allCandidates = [];
 
-            const bullishCandidates = topCryptos.filter(c => c.price_change_percentage_24h > config.momentumThreshold).slice(0, config.candidateCount);
-            const bearishCandidates = topCryptos.filter(c => c.price_change_percentage_24h < -config.momentumThreshold).slice(0, config.candidateCount);
-            log(`Found ${bullishCandidates.length} bullish and ${bearishCandidates.length} bearish candidates (threshold +/-${config.momentumThreshold}%).`, 'success');
-            log('Running local MA/structure/Fibonacci filter before any Gemini calls...\n');
+            if (config.marketType === 'forex') {
+                log(`Fetching quotes for ${config.forexPairs.length} configured pair(s) from Twelve Data...`);
+                const bullish = [], bearish = [];
+                for (const pair of config.forexPairs) {
+                    try {
+                        const quote = await fetchForexQuote(pair, twelveDataKey, currentController.signal);
+                        if (quote.percentChange > config.momentumThreshold) bullish.push({ pair, direction: 'bullish', quote });
+                        else if (quote.percentChange < -config.momentumThreshold) bearish.push({ pair, direction: 'bearish', quote });
+                    } catch (e) {
+                        if (e.name === 'AbortError') throw e;
+                        log(`${forexSymbolFor(pair)}: quote fetch failed - ${e.message}`, 'error');
+                    }
+                }
+                bullish.sort((a, b) => b.quote.percentChange - a.quote.percentChange);
+                bearish.sort((a, b) => a.quote.percentChange - b.quote.percentChange);
+                const bullishCandidates = bullish.slice(0, config.candidateCount);
+                const bearishCandidates = bearish.slice(0, config.candidateCount);
+                log(`Found ${bullishCandidates.length} bullish and ${bearishCandidates.length} bearish candidates (threshold +/-${config.momentumThreshold}%).`, 'success');
+                log('Running local MA/structure/Fibonacci filter before any Gemini calls...\n');
+                allCandidates = [...bullishCandidates, ...bearishCandidates].map(c => ({ forexPair: c.pair, direction: c.direction, quote: c.quote }));
+            } else {
+                log('Fetching top 50 markets from CoinGecko...');
+                const topCryptos = await fetchTopMarkets(currentController.signal);
+                const bullishCandidates = topCryptos.filter(c => c.price_change_percentage_24h > config.momentumThreshold).slice(0, config.candidateCount);
+                const bearishCandidates = topCryptos.filter(c => c.price_change_percentage_24h < -config.momentumThreshold).slice(0, config.candidateCount);
+                log(`Found ${bullishCandidates.length} bullish and ${bearishCandidates.length} bearish candidates (threshold +/-${config.momentumThreshold}%).`, 'success');
+                log('Running local MA/structure/Fibonacci filter before any Gemini calls...\n');
+                allCandidates = [
+                    ...bullishCandidates.map(c => ({ coin: c, direction: 'bullish' })),
+                    ...bearishCandidates.map(c => ({ coin: c, direction: 'bearish' }))
+                ];
+            }
 
-            const allCandidates = [
-                ...bullishCandidates.map(c => ({ coin: c, direction: 'bullish' })),
-                ...bearishCandidates.map(c => ({ coin: c, direction: 'bearish' }))
-            ];
             const total = allCandidates.length;
-            let geminiCallCount = 0;
 
             for (let i = 0; i < allCandidates.length; i++) {
                 if (currentController.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
 
-                const { coin, direction } = allCandidates[i];
-                const symbol = coin.symbol.toUpperCase();
+                const candidate = allCandidates[i];
+                const direction = candidate.direction;
+                const symbol = config.marketType === 'forex' ? forexSymbolFor(candidate.forexPair) : candidate.coin.symbol.toUpperCase();
                 setProgress(i, total, `Scanning ${i + 1}/${total}: ${symbol}`);
 
                 let result;
                 try {
-                    result = await analyzeCandidate(coin, direction, config, sessionInfo, apiKey, currentController.signal);
+                    result = config.marketType === 'forex'
+                        ? await analyzeForexCandidate(candidate.forexPair, direction, config, sessionInfo, apiKey, twelveDataKey, candidate.quote, currentController.signal)
+                        : await analyzeCandidate(candidate.coin, direction, config, sessionInfo, apiKey, currentController.signal);
                 } catch (e) {
-                    if (e.name === 'AbortError') throw e; // real cancel - stop the run
-                    // A single coin's fetch failing (network blip, brief Binance
-                    // hiccup, etc.) should not abort the other 11 - skip and
-                    // keep going, same as any other per-coin skip reason.
+                    if (e.name === 'AbortError') throw e;
                     result = { success: false, reason: `Unexpected error - skipped: ${e.message}` };
                 }
                 setProgress(i + 1, total, `Scanned ${i + 1}/${total}: ${symbol}`);
@@ -2235,14 +2389,16 @@ Respond ONLY with valid JSON, no extra text:
                     log(`${symbol} (${direction}): VALID setup found - logged to journal.${newsNote}`, 'success');
                 } else {
                     log(`${symbol} (${direction}): skipped - ${result.reason}`);
-                    if (/\b429\b|quota/i.test(result.reason)) {
-                        log(`\nGemini quota exceeded - stopping the scan here instead of retrying the same error on every remaining candidate (${total - i - 1} left unscanned).`, 'error');
-                        log('This is a Google API-side limit, not an app bug. Fixes: lower "Gemini requests/minute" in Settings, reduce Candidates per side, wait a bit for the quota window to reset, or check your plan/billing at https://ai.google.dev/gemini-api/docs/rate-limits', 'error');
+                    if (/\b429\b|quota|rate_limited|credit/i.test(result.reason)) {
+                        log(`\nAPI quota/rate limit hit - stopping the scan here instead of retrying the same error on every remaining candidate (${total - i - 1} left unscanned).`, 'error');
+                        log(config.marketType === 'forex'
+                            ? 'Lower "Twelve Data requests/minute" or "Gemini requests/minute" in Settings, reduce Candidates per side, or wait for the quota window to reset.'
+                            : 'Lower "Gemini requests/minute" in Settings, reduce Candidates per side, wait a bit for the quota window to reset, or check your plan/billing at https://ai.google.dev/gemini-api/docs/rate-limits', 'error');
                         break;
                     }
                 }
 
-                await sleep(300); // small courtesy delay between coins
+                await sleep(config.marketType === 'forex' ? 400 : 300);
             }
 
             setProgress(total, total, 'Done');
@@ -2255,7 +2411,7 @@ Respond ONLY with valid JSON, no extra text:
             } else {
                 rankAndRerenderCards();
                 if (lastValidTrades.longs.length + lastValidTrades.shorts.length > 1) {
-                    log('Multiple setups triggered this run - cards above are ranked by volume displacement (strongest institutional push first).', 'success');
+                    log('Multiple setups triggered this run - cards above are ranked by volume displacement (strongest institutional push first; forex trades tie at n/a and keep scan order).', 'success');
                 }
                 document.getElementById('copyBtn').style.display = 'block';
             }
@@ -2285,7 +2441,26 @@ Respond ONLY with valid JSON, no extra text:
         if (currentController) currentController.abort();
     }
 
+    // ------------------------------------------------------------------
+    // Market type UI toggle
+    // ------------------------------------------------------------------
+    function onMarketTypeChange() {
+        const isForex = document.getElementById('marketType').value === 'forex';
+        document.getElementById('cryptoOnlyNote').style.display = isForex ? 'none' : 'block';
+        document.getElementById('forexOnlyNote').style.display = isForex ? 'block' : 'none';
+        document.getElementById('twelveDataKeyWrap').style.display = isForex ? 'block' : 'none';
+        document.getElementById('forexPairsBlock').style.display = isForex ? 'block' : 'none';
+        document.getElementById('twelveDataRpmBlock').style.display = isForex ? 'block' : 'none';
+        document.getElementById('cryptoCandidateNote').style.display = isForex ? 'none' : 'block';
+        document.getElementById('backtestSymbol').placeholder = isForex ? 'e.g. EUR/USD, GBP/USD' : 'e.g. BTC, ETH, SOL';
+        document.getElementById('backtestSymbol').value = isForex ? 'EUR/USD' : 'BTC';
+        document.getElementById('batchSymbols').value = isForex
+            ? 'EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD,EUR/GBP'
+            : 'BTC,ETH,SOL,BNB,XRP,ADA,DOGE,LINK,AVAX,DOT,LTC,BCH';
+    }
+
     loadConfig();
+    onMarketTypeChange();
     renderJournal();
     renderCircuitBreakerStatus();
 </script>
