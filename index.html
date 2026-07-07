@@ -143,6 +143,10 @@
             <input type="text" id="forexPairs" value="EUR/USD,GBP/USD,USD/JPY,USD/CHF,AUD/USD,USD/CAD,NZD/USD,EUR/GBP,EUR/JPY,GBP/JPY">
         </div>
         <div>
+            <label for="volumeDisplacementRatio">Volume displacement threshold (x 20-bar avg volume)</label>
+            <input type="number" id="volumeDisplacementRatio" value="1.2" min="0.1" step="0.1">
+        </div>
+        <div>
             <label for="strictConfluence" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
                 <input type="checkbox" id="strictConfluence" checked style="width:auto; margin:0;">
                 Strict ICT confluence (require liquidity sweep + FVG)
@@ -219,7 +223,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -253,6 +257,7 @@
             twelveDataRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('twelveDataRpm').value) || 8)),
             strictConfluence: document.getElementById('strictConfluence').checked,
             killzoneOnly: document.getElementById('killzoneOnly').checked,
+            volumeDisplacementRatio: Math.max(0.1, parseFloat(document.getElementById('volumeDisplacementRatio').value) || 1.2),
             tpMode: document.getElementById('tpMode').value,
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
             minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
@@ -544,15 +549,18 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { type, entryPrice: type === 'market' ? currentPrice : optimalEntry, optimalEntry, distancePct, orderLabel };
     }
 
-    const VOLUME_DISPLACEMENT_RATIO = 1.2;
+    // Default kept only as a fallback; the live value comes from the
+    // Settings input (config.volumeDisplacementRatio) so it can be tuned
+    // and backtested instead of guessed.
+    const VOLUME_DISPLACEMENT_RATIO_DEFAULT = 1.2;
 
-    function checkVolumeDisplacement(volumesLTF) {
+    function checkVolumeDisplacement(volumesLTF, ratioThreshold = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
         if (!volumesLTF || volumesLTF.length < 20) return { ok: true, ratio: null };
         const recentVolume = volumesLTF[volumesLTF.length - 1];
         const avgVolume = volumesLTF.slice(-20).reduce((a, b) => a + b, 0) / 20;
         if (avgVolume === 0) return { ok: true, ratio: null };
         const ratio = recentVolume / avgVolume;
-        return { ok: ratio >= VOLUME_DISPLACEMENT_RATIO, ratio };
+        return { ok: ratio >= ratioThreshold, ratio };
     }
 
     // ------------------------------------------------------------------
@@ -622,7 +630,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // volume data (forex) bypass the displacement gate instead of being
     // penalized for not having something Binance-style crypto candles
     // provide and forex candles structurally don't.
-    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence, skipVolumeCheck) {
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
 
@@ -641,9 +649,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
         if (!inOTE) return { pass: false, reason: 'Price not currently in 61.8-78.6% OTE zone (LTF filter failed)' };
 
-        const volCheck = skipVolumeCheck ? { ok: true, ratio: null } : checkVolumeDisplacement(volumesLTF);
+        const volCheck = skipVolumeCheck ? { ok: true, ratio: null } : checkVolumeDisplacement(volumesLTF, volumeDisplacementRatio);
         if (!volCheck.ok) {
-            return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${VOLUME_DISPLACEMENT_RATIO}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
+            return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${volumeDisplacementRatio}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
         }
 
         const sweep = detectLiquiditySweep(candlesLTF, direction);
@@ -1117,7 +1125,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly, skipVolumeCheck) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1134,7 +1142,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence, skipVolumeCheck);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence, skipVolumeCheck, volumeDisplacementRatio);
                 if (filterResult.pass) {
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
                     if (levels) {
@@ -1242,8 +1250,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             if (marketType === 'forex') btLogFn(`Forex mode: volume displacement check is auto-passed (no real volume data for FX).`);
             btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
 
@@ -1348,8 +1356,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 let allTrades = [];
                 let longCount = 0, shortCount = 0;
                 symbolData.forEach(({ klines1h, klines5m }) => {
-                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
-                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck);
+                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
                     longCount += longTrades.length;
                     shortCount += shortTrades.length;
                     allTrades = allTrades.concat(longTrades, shortTrades);
@@ -1919,7 +1927,7 @@ Respond ONLY with valid JSON, no extra text:
             return `<div class="row muted">Volume displacement: n/a - forex has no centralized volume feed, so this check is auto-passed.</div>`;
         }
         if (trade.volumeRatio === null || trade.volumeRatio === undefined) return '';
-        return `<div class="row muted">Volume displacement: ${trade.volumeRatio.toFixed(2)}x the 20-bar average (institutional threshold: ${VOLUME_DISPLACEMENT_RATIO}x)</div>`;
+        return `<div class="row muted">Volume displacement: ${trade.volumeRatio.toFixed(2)}x the 20-bar average (institutional threshold: ${trade.volumeThresholdUsed || VOLUME_DISPLACEMENT_RATIO_DEFAULT}x)</div>`;
     }
 
     function renderConfluenceSection(trade) {
@@ -2046,7 +2054,7 @@ Respond ONLY with valid JSON, no extra text:
             };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, false);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, false, config.volumeDisplacementRatio);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
@@ -2108,6 +2116,7 @@ Respond ONLY with valid JSON, no extra text:
                 currentPrice: currentPrice.toFixed(6),
                 distancePct: orderInfo.distancePct,
                 volumeRatio: filterResult.volumeRatio,
+                volumeThresholdUsed: config.volumeDisplacementRatio,
                 sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
                 sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
                 fvgConfluence: !!filterResult.fvgMatch,
@@ -2172,7 +2181,7 @@ Respond ONLY with valid JSON, no extra text:
         }
 
         // skipVolumeCheck = true: forex has no centralized volume feed.
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, true);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, true, config.volumeDisplacementRatio);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
