@@ -103,6 +103,10 @@
             <input type="number" id="momentumThreshold" value="3" min="0.1" step="0.1">
         </div>
         <div>
+            <label for="backtestHistoryDays">Backtest history depth (days)</label>
+            <input type="number" id="backtestHistoryDays" value="30" min="3" max="90" step="1">
+        </div>
+        <div>
             <label for="targetRR">Target Risk:Reward (used when TP Mode = Fixed RR)</label>
             <input type="number" id="targetRR" value="3" min="1" step="0.5">
         </div>
@@ -260,7 +264,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -293,6 +297,7 @@
             geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
             twelveDataRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('twelveDataRpm').value) || 8)),
             killzoneOnly: document.getElementById('killzoneOnly').checked,
+            backtestHistoryDays: Math.min(90, Math.max(3, parseInt(document.getElementById('backtestHistoryDays').value) || 30)),
             volumeDisplacementRatio: Math.max(0.1, parseFloat(document.getElementById('volumeDisplacementRatio').value) || 1.2),
             minConfluenceScore: Math.min(100, Math.max(0, parseFloat(document.getElementById('minConfluenceScore').value) || 0)),
             confluenceWeights: {
@@ -936,6 +941,32 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return coin.symbol.toUpperCase() + 'USDT';
     }
 
+    const INTERVAL_MS = { '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000, '4h': 14400000, '1d': 86400000 };
+
+    // Binance caps a single /klines call at 1000 bars. To backtest a
+    // realistic window (weeks/months, not the ~3.5 days you get from one
+    // call at 5m resolution) we page backwards in time and stitch the
+    // batches together, deduplicating by openTime.
+    async function fetchKlinesRange(symbol, interval, days, signal) {
+        const intervalMs = INTERVAL_MS[interval] || 3600000;
+        const totalNeeded = Math.ceil(days * 24 * 60 * 60 * 1000 / intervalMs);
+        let cursor = Date.now() - totalNeeded * intervalMs;
+        const byOpenTime = new Map();
+        let guard = 0;
+        while (byOpenTime.size < totalNeeded && guard < 60) {
+            guard++;
+            const batch = await fetchKlines(symbol, interval, 1000, signal, cursor);
+            if (!batch || batch.length === 0) break;
+            batch.forEach(k => byOpenTime.set(k.openTime, k));
+            const last = batch[batch.length - 1];
+            if (batch.length < 1000) break; // caught up to present
+            cursor = last.closeTime + 1;
+            await sleep(60);
+        }
+        const sorted = Array.from(byOpenTime.values()).sort((a, b) => a.openTime - b.openTime);
+        return sorted.slice(-totalNeeded);
+    }
+
     async function fetchKlines(symbol, interval, limit, signal, startTime) {
         let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         if (startTime) url += `&startTime=${startTime}`;
@@ -1258,17 +1289,22 @@ After searching, respond with ONLY this JSON object and no other text before or 
     // Generic "fetch a symbol's 1h+5m candle history for backtesting"
     // that branches by market type, so runBacktest / runBatchBacktest
     // don't need to duplicate the branching logic themselves.
-    async function fetchBacktestCandlePair(symbolOrPair, marketType, signal, twelveDataKey) {
+    async function fetchBacktestCandlePair(symbolOrPair, marketType, signal, twelveDataKey, historyDays = 30) {
         if (marketType === 'forex') {
-            const r1h = await fetchForexSeriesDetailed(symbolOrPair, '1h', 500, twelveDataKey, signal);
+            // Twelve Data's free tier serves large windows in one call
+            // (no pagination needed), but is capped and rate-limited, so
+            // clamp the request size rather than hammering it.
+            const outputsize1h = Math.min(5000, Math.ceil(historyDays * 24));
+            const outputsize5m = Math.min(5000, Math.ceil(historyDays * 24 * 12));
+            const r1h = await fetchForexSeriesDetailed(symbolOrPair, '1h', outputsize1h, twelveDataKey, signal);
             if (!r1h.ok) return { ok: false, reason: r1h.reason, detail: r1h.detail };
-            const r5m = await fetchForexSeriesDetailed(symbolOrPair, '5m', 1000, twelveDataKey, signal);
+            const r5m = await fetchForexSeriesDetailed(symbolOrPair, '5m', outputsize5m, twelveDataKey, signal);
             if (!r5m.ok) return { ok: false, reason: r5m.reason, detail: r5m.detail };
             return { ok: true, klines1h: r1h.klines, klines5m: r5m.klines };
         }
-        const klines1h = await fetchKlines(symbolOrPair, '1h', 500, signal);
-        const klines5m = await fetchKlines(symbolOrPair, '5m', 1000, signal);
-        if (!klines1h || !klines5m) return { ok: false, reason: 'no_pair', detail: 'No Binance pair or fetch failed' };
+        const klines1h = await fetchKlinesRange(symbolOrPair, '1h', historyDays, signal);
+        const klines5m = await fetchKlinesRange(symbolOrPair, '5m', historyDays, signal);
+        if (!klines1h || !klines1h.length || !klines5m || !klines5m.length) return { ok: false, reason: 'no_pair', detail: 'No Binance pair or fetch failed' };
         return { ok: true, klines1h, klines5m };
     }
 
@@ -1304,9 +1340,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
         btBtn.disabled = true;
         try {
-            btLogFn(`Fetching historical data for ${symbolOrPair}...`);
+            btLogFn(`Fetching ~${config.backtestHistoryDays} days of historical data for ${symbolOrPair} (this takes longer than before - it's paging multiple requests to get real depth)...`);
             const controller = new AbortController();
-            const fetched = await fetchBacktestCandlePair(symbolOrPair, marketType, controller.signal, twelveDataKey);
+            const fetched = await fetchBacktestCandlePair(symbolOrPair, marketType, controller.signal, twelveDataKey, config.backtestHistoryDays);
             if (!fetched.ok) {
                 btLogFn(`Could not fetch history for ${symbolOrPair}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''}`, 'error');
                 return;
@@ -1330,18 +1366,74 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             btLogFn(fmtStats('LONGS', longStats), 'success');
             btLogFn(fmtStats('SHORTS', shortStats), 'success');
-            btLogFn('\nRemember: this is one symbol, one recent data window, and it excludes Gemini entirely. Small sample sizes here are NOT a reliable estimate of edge - re-run across multiple symbols and time windows before drawing conclusions.', 'error');
+            btLogFn('\nRemember: this is one symbol and it excludes Gemini entirely. Check the consistency table below before trusting these numbers - and re-run across multiple symbols (Settings Sweep tab) before drawing conclusions.', 'error');
+
+            const periodStartMs = klines5m[0].closeTime;
+            const periodEndMs = klines5m[klines5m.length - 1].closeTime;
+            const combinedTrades = [...longTrades, ...shortTrades];
+            const windows = regimeSplit(combinedTrades, periodStartMs, periodEndMs, 3);
 
             btResults.innerHTML = `
-                <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''})</strong></div>
+                <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''}, ${config.backtestHistoryDays}d history)</strong></div>
                 <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
                 <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
+                ${renderRegimeSplitTable(windows)}
             `;
         } catch (e) {
             btLogFn(`Backtest error: ${e.message}`, 'error');
         } finally {
             btBtn.disabled = false;
         }
+    }
+
+    // Splits trades into N consecutive time buckets across the tested
+    // window and summarizes each separately. A strategy with real edge
+    // should look roughly similar bucket to bucket; one that only "works"
+    // in a single bucket is fitting to one regime (e.g. one trending
+    // stretch), not finding a durable edge.
+    function regimeSplit(trades, periodStartMs, periodEndMs, numBuckets = 3) {
+        const span = periodEndMs - periodStartMs;
+        if (span <= 0) return [];
+        const buckets = Array.from({ length: numBuckets }, () => []);
+        trades.forEach(t => {
+            let idx = Math.floor((t.entryTime - periodStartMs) / span * numBuckets);
+            idx = Math.min(numBuckets - 1, Math.max(0, idx));
+            buckets[idx].push(t);
+        });
+        return buckets.map((bucketTrades, i) => ({
+            label: `Window ${i + 1}/${numBuckets}`,
+            startMs: periodStartMs + (span / numBuckets) * i,
+            endMs: periodStartMs + (span / numBuckets) * (i + 1),
+            stats: summarizeBacktest(bucketTrades)
+        }));
+    }
+
+    function renderRegimeSplitTable(windows) {
+        if (windows.length === 0) return '';
+        const fmtDate = ms => new Date(ms).toLocaleDateString();
+        return `
+            <div class="row muted" style="margin-top:8px;">Consistency check - same combined (long+short) trades split into consecutive time windows. Real edge tends to look similar window to window; a strategy that only profits in one window is fitted to that window's regime, not a durable edge.</div>
+            <table style="width:100%; border-collapse:collapse; font-size:12px; margin-top:4px;">
+                <thead>
+                    <tr style="text-align:left; border-bottom:2px solid #ddd;">
+                        <th style="padding:4px;">Window</th>
+                        <th style="padding:4px;">Signals</th>
+                        <th style="padding:4px;">Win Rate</th>
+                        <th style="padding:4px;">Total R</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${windows.map(w => `
+                        <tr style="border-bottom:1px solid #eee;">
+                            <td style="padding:4px;">${w.label}<br><span class="muted">${fmtDate(w.startMs)} - ${fmtDate(w.endMs)}</span></td>
+                            <td style="padding:4px;">${w.stats.count}</td>
+                            <td style="padding:4px;">${w.stats.winRate !== null ? w.stats.winRate.toFixed(1) + '%' : 'n/a'}</td>
+                            <td style="padding:4px; ${w.stats.totalR > 0 ? 'color:#0a7d2c;' : w.stats.totalR < 0 ? 'color:#b00020;' : ''}">${w.stats.totalR.toFixed(2)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
     }
 
     function parseSymbolList(raw) {
@@ -1400,12 +1492,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
         btn.disabled = true;
         try {
-            blog(`Fetching historical candles for ${symbols.length} symbol(s): ${symbols.join(', ')}...`);
+            blog(`Fetching ~${config.backtestHistoryDays} days of historical candles for ${symbols.length} symbol(s): ${symbols.join(', ')} (paged fetch - this takes longer than before)...`);
             const controller = new AbortController();
             const symbolData = [];
 
             for (const symbol of symbols) {
-                const fetched = await fetchBacktestCandlePair(symbol, marketType, controller.signal, twelveDataKey);
+                const fetched = await fetchBacktestCandlePair(symbol, marketType, controller.signal, twelveDataKey, config.backtestHistoryDays);
                 if (!fetched.ok) {
                     blog(`${symbol}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''} - skipped.`, 'error');
                     continue;
@@ -1437,7 +1529,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         shortCount += shortTrades.length;
                         allTrades = allTrades.concat(longTrades, shortTrades);
                     });
-                    sweepResults.push({ score, rr, longCount, shortCount, stats: summarizeBacktest(allTrades) });
+                    sweepResults.push({ score, rr, longCount, shortCount, stats: summarizeBacktest(allTrades), trades: allTrades });
                 });
             });
 
@@ -1476,11 +1568,20 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         }).join('')}
                     </tbody>
                 </table>
+                ${bestByTotalR ? (() => {
+                    const periodStartMs = Math.min(...symbolData.map(d => d.klines5m[0].closeTime));
+                    const periodEndMs = Math.max(...symbolData.map(d => d.klines5m[d.klines5m.length - 1].closeTime));
+                    const windows = regimeSplit(bestByTotalR.trades, periodStartMs, periodEndMs, 3);
+                    return `<div class="row" style="margin-top:8px;"><strong>Consistency check for the starred combo (score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1)</strong></div>${renderRegimeSplitTable(windows)}`;
+                })() : ''}
             `;
 
             blog(`Done. Tested across ${symbolData.length} symbol(s): ${symbolData.map(d => d.symbol).join(', ')}.`, 'success');
             if (bestByTotalR) {
                 blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate).`, 'success');
+                if (bestByTotalR.stats.totalR <= 0) {
+                    blog(`Heads up: even the best combination here is flat or net negative in R. That means nothing in this grid has demonstrated edge yet on this data - widening the symbol list, the score/RR ranges, or the history window is more useful right now than picking a "winner" from this table.`, 'error');
+                }
             } else {
                 blog('No signals triggered for any combination in this window - try lowering the confluence score values, loosening Kill Zone Only in Settings, or widen the symbol list.', 'error');
             }
