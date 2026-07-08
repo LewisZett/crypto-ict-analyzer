@@ -147,12 +147,6 @@
             <input type="number" id="volumeDisplacementRatio" value="1.2" min="0.1" step="0.1">
         </div>
         <div>
-            <label for="strictConfluence" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
-                <input type="checkbox" id="strictConfluence" checked style="width:auto; margin:0;">
-                Strict ICT confluence (require liquidity sweep + FVG)
-            </label>
-        </div>
-        <div>
             <label for="killzoneOnly" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
                 <input type="checkbox" id="killzoneOnly" style="width:auto; margin:0;">
                 Kill zone only (London/NY sessions - applies to both Backtest and Live Run)
@@ -172,6 +166,47 @@
     </div>
 </details>
 
+<details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
+    <summary><strong>Confluence Scoring</strong> (replaces the old all-or-nothing strict filter)</summary>
+    <div class="row muted" style="margin-top:6px;">
+        Each factor below contributes points if it's present. A trade needs a total score &ge; the threshold to pass -
+        it no longer needs every single factor at once. One hard rule stays outside the score: if BOTH the MA trend
+        and the structure (HH/HL or LH/LL) disagree with the trade direction, it's rejected regardless of score -
+        this stops outright counter-trend trades from sneaking through on sweep/FVG/volume alone.
+    </div>
+    <div class="config-grid" style="margin-top:8px;">
+        <div>
+            <label for="minConfluenceScore">Minimum score to pass (0-100)</label>
+            <input type="number" id="minConfluenceScore" value="60" min="0" max="100" step="1">
+        </div>
+        <div></div>
+        <div>
+            <label for="weightSma">Weight: MA trend side</label>
+            <input type="number" id="weightSma" value="15" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightStructure">Weight: Structure (HH/HL, LH/LL)</label>
+            <input type="number" id="weightStructure" value="15" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightOte">Weight: OTE zone (61.8-78.6%)</label>
+            <input type="number" id="weightOte" value="20" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightSweep">Weight: Liquidity sweep</label>
+            <input type="number" id="weightSweep" value="20" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightFvg">Weight: FVG confluence</label>
+            <input type="number" id="weightFvg" value="15" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightVolume">Weight: Volume displacement</label>
+            <input type="number" id="weightVolume" value="15" min="0" step="1">
+        </div>
+    </div>
+</details>
+
 <button id="runBtn" onclick="runAnalysis()">Run ICT Analysis (Both Bullish &amp; Bearish)</button>
 <button id="cancelBtn" onclick="cancelAnalysis()">Cancel</button>
 
@@ -186,13 +221,15 @@
 </details>
 
 <details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
-    <summary><strong>Batch Backtest / RR Sweep (no API key needed)</strong> - tests many symbols and/or many RR values in one run</summary>
-    <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value you list against those same trades - so instead of one symbol / one guessed RR, you get a real aggregate sample size and a direct side-by-side comparison of which RR actually performs best, rather than assuming.</p>
+    <summary><strong>Settings Sweep (no API key needed)</strong> - tests many symbols, RR values, and confluence thresholds in one run</summary>
+    <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value AND every minimum confluence score you list against those same trades - so instead of guessing at a threshold, you get a grid comparing every combination side-by-side on a real sample size. Confluence weights come from the Settings panel above; this sweeps the pass/fail threshold, not the weights themselves.</p>
     <label for="batchSymbols">Symbols (comma-separated; Binance USDT pairs for crypto, or Twelve Data pairs like EUR/USD for forex)</label>
     <input type="text" id="batchSymbols" value="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,LINK,AVAX,DOT,LTC,BCH">
     <label for="batchRRValues">RR values to test (comma-separated)</label>
     <input type="text" id="batchRRValues" value="1.5,2,2.5,3,3.5,4">
-    <button id="batchBacktestBtn" onclick="runBatchBacktest()">Run Batch Backtest / RR Sweep</button>
+    <label for="batchScoreValues">Min confluence score values to test (comma-separated, 0-100)</label>
+    <input type="text" id="batchScoreValues" value="40,50,60,70,80">
+    <button id="batchBacktestBtn" onclick="runBatchBacktest()">Run Settings Sweep</button>
     <div id="batchBacktestResults" style="margin-top:8px; overflow-x:auto;"></div>
     <div id="batchBacktestLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:220px; overflow:auto;"></div>
 </details>
@@ -223,7 +260,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'strictConfluence', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -255,9 +292,17 @@
             candidateCount: Math.max(1, Math.min(25, parseInt(document.getElementById('candidateCount').value) || 10)),
             geminiRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('geminiRpm').value) || 8)),
             twelveDataRpm: Math.max(1, Math.min(60, parseInt(document.getElementById('twelveDataRpm').value) || 8)),
-            strictConfluence: document.getElementById('strictConfluence').checked,
             killzoneOnly: document.getElementById('killzoneOnly').checked,
             volumeDisplacementRatio: Math.max(0.1, parseFloat(document.getElementById('volumeDisplacementRatio').value) || 1.2),
+            minConfluenceScore: Math.min(100, Math.max(0, parseFloat(document.getElementById('minConfluenceScore').value) || 0)),
+            confluenceWeights: {
+                sma: Math.max(0, parseFloat(document.getElementById('weightSma').value) || 0),
+                structure: Math.max(0, parseFloat(document.getElementById('weightStructure').value) || 0),
+                ote: Math.max(0, parseFloat(document.getElementById('weightOte').value) || 0),
+                sweep: Math.max(0, parseFloat(document.getElementById('weightSweep').value) || 0),
+                fvg: Math.max(0, parseFloat(document.getElementById('weightFvg').value) || 0),
+                volume: Math.max(0, parseFloat(document.getElementById('weightVolume').value) || 0)
+            },
             tpMode: document.getElementById('tpMode').value,
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
             minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
@@ -626,48 +671,69 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fvgs.find(g => price >= g.bottom && price <= g.top) || null;
     }
 
-    // Hard local filter. `skipVolumeCheck` lets an asset class with no real
-    // volume data (forex) bypass the displacement gate instead of being
-    // penalized for not having something Binance-style crypto candles
-    // provide and forex candles structurally don't.
-    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, strictConfluence, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
+    // Weighted confluence scoring replaces the old all-or-nothing AND chain.
+    // Each factor contributes its configured weight if satisfied; the trade
+    // passes if the achieved percentage of the applicable max score clears
+    // minConfluenceScore. `skipVolumeCheck` (forex) removes the volume
+    // factor entirely from both sides of the ratio rather than free-passing
+    // it, so it doesn't inflate the score for an asset class that has no
+    // real volume feed to judge.
+    //
+    // One rule sits outside the score on purpose: if BOTH the MA trend and
+    // the HH/HL structure disagree with the trade direction, it's rejected
+    // outright. Without this, a high sweep+FVG+volume score could wave
+    // through a trade that's fighting every directional signal available -
+    // that's not "aggressive confluence trading," it's picking fights with
+    // the trend, so it stays a hard rule rather than a score input.
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
 
         const sma = calculateSMA(closesHTF, 20);
         if (sma === null) return { pass: false, reason: 'Insufficient HTF data for 20-period MA' };
 
-        const maOk = direction === 'bullish' ? currentPrice > sma : currentPrice < sma;
-        if (!maOk) return { pass: false, reason: 'Price on wrong side of 20-period MA (MTF filter failed)' };
-
-        const structureOk = checkTrendStructure(closesHTF, direction, Math.min(50, closesHTF.length));
-        if (!structureOk) return { pass: false, reason: 'HTF structure does not show clear HH/HL or LH/LL' };
-
         const swing = findSwingHighLow(closesLTF, Math.min(50, closesLTF.length));
         if (swing.high === swing.low) return { pass: false, reason: 'No meaningful LTF price range to compute Fibonacci levels' };
 
-        const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
-        if (!inOTE) return { pass: false, reason: 'Price not currently in 61.8-78.6% OTE zone (LTF filter failed)' };
+        const maOk = direction === 'bullish' ? currentPrice > sma : currentPrice < sma;
+        const structureOk = checkTrendStructure(closesHTF, direction, Math.min(50, closesHTF.length));
 
-        const volCheck = skipVolumeCheck ? { ok: true, ratio: null } : checkVolumeDisplacement(volumesLTF, volumeDisplacementRatio);
-        if (!volCheck.ok) {
-            return { pass: false, reason: `Displacement failed: volume is below institutional threshold (${volumeDisplacementRatio}x 20-bar avg, actual ${volCheck.ratio.toFixed(2)}x)` };
+        if (!maOk && !structureOk) {
+            return { pass: false, reason: 'Both MA trend and HH/HL structure disagree with this direction - hard rejected regardless of confluence score' };
         }
 
+        const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
+        const volCheck = skipVolumeCheck ? null : checkVolumeDisplacement(volumesLTF, volumeDisplacementRatio);
         const sweep = detectLiquiditySweep(candlesLTF, direction);
         const fvgs = findFVGs(candlesLTF.slice(-60), direction);
         const fvgMatch = findFVGContainingPrice(currentPrice, fvgs);
 
-        if (strictConfluence) {
-            if (!sweep.swept) {
-                return { pass: false, reason: 'No confirmed liquidity sweep of a prior swing point - this retracement looks organic, not a stop hunt' };
-            }
-            if (!fvgMatch) {
-                return { pass: false, reason: 'Price is not sitting inside an unmitigated Fair Value Gap from this leg' };
-            }
+        const factors = [
+            { label: 'MA trend', ok: maOk, weight: weights.sma },
+            { label: 'Structure', ok: structureOk, weight: weights.structure },
+            { label: 'OTE zone', ok: inOTE, weight: weights.ote },
+            { label: 'Liquidity sweep', ok: sweep.swept, weight: weights.sweep },
+            { label: 'FVG', ok: !!fvgMatch, weight: weights.fvg }
+        ];
+        if (volCheck !== null) factors.push({ label: 'Volume displacement', ok: volCheck.ok, weight: weights.volume });
+
+        const maxScore = factors.reduce((s, f) => s + f.weight, 0);
+        const achieved = factors.filter(f => f.ok).reduce((s, f) => s + f.weight, 0);
+        const scorePct = maxScore > 0 ? (achieved / maxScore * 100) : 0;
+        const passedLabels = factors.filter(f => f.ok).map(f => f.label);
+        const failedLabels = factors.filter(f => !f.ok).map(f => f.label);
+
+        if (scorePct < minConfluenceScore) {
+            return {
+                pass: false,
+                reason: `Confluence score ${scorePct.toFixed(0)}% below ${minConfluenceScore}% threshold - passed: ${passedLabels.join(', ') || 'none'}; missing: ${failedLabels.join(', ')}`
+            };
         }
 
-        return { pass: true, sma, swing, volumeRatio: volCheck.ratio, sweep, fvgMatch };
+        return {
+            pass: true, sma, swing, volumeRatio: volCheck ? volCheck.ratio : null, sweep, fvgMatch,
+            confluenceScore: scorePct, confluenceBreakdown: { passed: passedLabels, failed: failedLabels }
+        };
     }
 
     const STRUCTURAL_BUFFER_RATIO = 0.10;
@@ -1125,7 +1191,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, strictConfluence, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1142,7 +1208,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, strictConfluence, skipVolumeCheck, volumeDisplacementRatio);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio);
                 if (filterResult.pass) {
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
                     if (levels) {
@@ -1248,10 +1314,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const { klines1h, klines5m } = fetched;
             btLogFn(`Got ${klines1h.length} 1h candles (~${Math.round(klines1h.length / 24)} days) and ${klines5m.length} 5m candles (~${(klines5m.length * 5 / 60 / 24).toFixed(1)} days).`);
             if (marketType === 'forex') btLogFn(`Forex mode: volume displacement check is auto-passed (no real volume data for FX).`);
-            btLogFn(`Replaying local filter logic bar-by-bar (no Gemini)${config.strictConfluence ? ' with STRICT confluence (liquidity sweep + FVG required)' : ' - strict confluence is OFF in Settings'}${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
+            btLogFn(`Replaying local filter logic bar-by-bar (no Gemini) | confluence score threshold: ${config.minConfluenceScore}%${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
 
@@ -1297,6 +1363,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
         )).sort((a, b) => a - b);
     }
 
+    function parseScoreList(raw) {
+        return Array.from(new Set(
+            raw.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v) && v >= 0 && v <= 100)
+        )).sort((a, b) => a - b);
+    }
+
     async function runBatchBacktest() {
         const btn = document.getElementById('batchBacktestBtn');
         const logEl = document.getElementById('batchBacktestLog');
@@ -1317,9 +1389,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
             ? parsePairList(document.getElementById('batchSymbols').value)
             : parseSymbolList(document.getElementById('batchSymbols').value);
         const rrValues = parseRRList(document.getElementById('batchRRValues').value);
+        const scoreValues = parseScoreList(document.getElementById('batchScoreValues').value);
 
         if (symbols.length === 0) { blog('Enter at least one symbol.', 'error'); return; }
         if (rrValues.length === 0) { blog('Enter at least one valid RR value.', 'error'); return; }
+        if (scoreValues.length === 0) { blog('Enter at least one valid confluence score (0-100).', 'error'); return; }
         if (marketType === 'forex' && !twelveDataKey) { blog('Enter your Twelve Data API key above to batch-backtest forex pairs.', 'error'); return; }
 
         const maxHoldBars = 288;
@@ -1346,32 +1420,35 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 return;
             }
 
-            blog(`\nTesting ${rrValues.length} RR value(s) across ${symbolData.length} symbol(s)`
-                + `${config.strictConfluence ? ' | STRICT confluence ON' : ' | strict confluence OFF'}`
+            blog(`\nTesting ${rrValues.length} RR value(s) x ${scoreValues.length} confluence score threshold(s) = ${rrValues.length * scoreValues.length} combinations across ${symbolData.length} symbol(s)`
                 + `${config.killzoneOnly ? ' | KILL ZONE ONLY ON' : ' | kill zone restriction OFF'}`
                 + `${marketType === 'forex' ? ' | volume check auto-passed (forex)' : ''}`
-                + ` (settings taken from the Settings panel above)...\n`);
+                + ` (confluence weights taken from the Settings panel above)...\n`);
 
-            const rrResults = rrValues.map(rr => {
-                let allTrades = [];
-                let longCount = 0, shortCount = 0;
-                symbolData.forEach(({ klines1h, klines5m }) => {
-                    const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-                    const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.strictConfluence, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-                    longCount += longTrades.length;
-                    shortCount += shortTrades.length;
-                    allTrades = allTrades.concat(longTrades, shortTrades);
+            const sweepResults = [];
+            scoreValues.forEach(score => {
+                rrValues.forEach(rr => {
+                    let allTrades = [];
+                    let longCount = 0, shortCount = 0;
+                    symbolData.forEach(({ klines1h, klines5m }) => {
+                        const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+                        const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+                        longCount += longTrades.length;
+                        shortCount += shortTrades.length;
+                        allTrades = allTrades.concat(longTrades, shortTrades);
+                    });
+                    sweepResults.push({ score, rr, longCount, shortCount, stats: summarizeBacktest(allTrades) });
                 });
-                return { rr, longCount, shortCount, stats: summarizeBacktest(allTrades) };
             });
 
-            const bestByTotalR = rrResults.reduce((best, r) =>
+            const bestByTotalR = sweepResults.reduce((best, r) =>
                 (r.stats.count > 0 && r.stats.totalR > (best ? best.stats.totalR : -Infinity)) ? r : best, null);
 
             resultsEl.innerHTML = `
                 <table style="width:100%; border-collapse:collapse; font-size:13px;">
                     <thead>
                         <tr style="text-align:left; border-bottom:2px solid #ddd;">
+                            <th style="padding:4px;">Score</th>
                             <th style="padding:4px;">RR</th>
                             <th style="padding:4px;">Signals (L/S)</th>
                             <th style="padding:4px;">W/L/Timeout</th>
@@ -1382,12 +1459,13 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         </tr>
                     </thead>
                     <tbody>
-                        ${rrResults.map(r => {
+                        ${sweepResults.map(r => {
                             const s = r.stats;
-                            const isBest = bestByTotalR && r.rr === bestByTotalR.rr;
+                            const isBest = bestByTotalR && r.rr === bestByTotalR.rr && r.score === bestByTotalR.score;
                             return `
                             <tr style="border-bottom:1px solid #eee; ${isBest ? 'background:#eaffea; font-weight:bold;' : ''}">
-                                <td style="padding:4px;">${r.rr}:1${isBest ? ' &#9733;' : ''}</td>
+                                <td style="padding:4px;">${r.score}%${isBest ? ' &#9733;' : ''}</td>
+                                <td style="padding:4px;">${r.rr}:1</td>
                                 <td style="padding:4px;">${s.count} (${r.longCount}/${r.shortCount})</td>
                                 <td style="padding:4px;">${s.wins}/${s.losses}/${s.timeouts}</td>
                                 <td style="padding:4px;">${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'}</td>
@@ -1402,14 +1480,14 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             blog(`Done. Tested across ${symbolData.length} symbol(s): ${symbolData.map(d => d.symbol).join(', ')}.`, 'success');
             if (bestByTotalR) {
-                blog(`Highest total R: RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate).`, 'success');
+                blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate).`, 'success');
             } else {
-                blog('No signals triggered for any RR value in this window - try loosening Strict Confluence or Kill Zone Only in Settings, or widen the symbol list.', 'error');
+                blog('No signals triggered for any combination in this window - try lowering the confluence score values, loosening Kill Zone Only in Settings, or widen the symbol list.', 'error');
             }
 
-            const lowSampleRows = rrResults.filter(r => r.stats.count > 0 && r.stats.count < 20);
+            const lowSampleRows = sweepResults.filter(r => r.stats.count > 0 && r.stats.count < 20);
             if (lowSampleRows.length > 0) {
-                blog(`\nSample size note: ${lowSampleRows.map(r => `RR ${r.rr} (${r.stats.count} signals)`).join(', ')} still have under ~20 signals - treat those rows as directional, not conclusive.`, 'error');
+                blog(`\nSample size note: ${lowSampleRows.length} of ${sweepResults.length} combinations still have under ~20 signals - treat those as directional, not conclusive. Add more symbols or widen the score/RR ranges to build sample size faster.`, 'error');
             }
         } catch (e) {
             blog(`Batch backtest error: ${e.message}`, 'error');
@@ -1477,6 +1555,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             sweepLevel: trade.sweepLevel !== undefined ? trade.sweepLevel : null,
             fvgConfluence: trade.fvgConfluence !== undefined ? trade.fvgConfluence : null,
             fvgRange: trade.fvgRange || null,
+            confluenceScore: trade.confluenceScore !== undefined ? trade.confluenceScore : null,
+            confluenceBreakdown: trade.confluenceBreakdown || null,
             tpMode: trade.tpMode || null,
             extensionRatioUsed: trade.extensionRatioUsed || null,
             loggedAt: Date.now(),
@@ -1528,7 +1608,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 : 'Not recorded for this entry.';
             const volText = (e.volumeRatio !== null && e.volumeRatio !== undefined) ? `${e.volumeRatio.toFixed(2)}x 20-bar avg` : (e.marketType === 'forex' ? 'n/a (forex - no volume data)' : 'n/a');
             const confluenceText = (e.sweepConfirmed !== null && e.sweepConfirmed !== undefined)
-                ? `Sweep: ${e.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${e.fvgConfluence ? 'yes' : 'no'}`
+                ? `${(e.confluenceScore !== null && e.confluenceScore !== undefined) ? `Score: ${e.confluenceScore.toFixed(0)}% | ` : ''}Sweep: ${e.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${e.fvgConfluence ? 'yes' : 'no'}`
                 : 'Not recorded for this entry.';
             const tpModeText = !e.tpMode || e.tpMode === 'fixedRR'
                 ? 'Fixed RR'
@@ -1717,7 +1797,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function exportJournalCSV() {
         const journal = loadJournal();
         if (journal.length === 0) return;
-        const header = 'id,marketType,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,tpMode,extensionRatioUsed,notes\n';
+        const header = 'id,marketType,loggedAt,symbol,direction,entry,sl,tp,rr,confidence,status,resolvedAt,rrAchieved,units,positionUSD,riskAmount,dataAgeMinutes,orderType,currentPrice,volumeRatio,sweepConfirmed,fvgConfluence,confluenceScore,tpMode,extensionRatioUsed,notes\n';
         const rows = journal.map(e => [
             e.id, e.marketType || 'crypto', new Date(e.loggedAt).toISOString(), e.symbol, e.direction, e.entry, e.sl, e.tp, e.rr,
             e.confidence, e.status, e.resolvedAt ? new Date(e.resolvedAt).toISOString() : '',
@@ -1728,6 +1808,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             e.volumeRatio !== null && e.volumeRatio !== undefined ? e.volumeRatio.toFixed(4) : '',
             e.sweepConfirmed === true ? 'true' : e.sweepConfirmed === false ? 'false' : '',
             e.fvgConfluence === true ? 'true' : e.fvgConfluence === false ? 'false' : '',
+            e.confluenceScore !== null && e.confluenceScore !== undefined ? e.confluenceScore.toFixed(1) : '',
             e.tpMode || '', e.extensionRatioUsed !== null && e.extensionRatioUsed !== undefined ? e.extensionRatioUsed : '',
             `"${(e.notes || '').replace(/"/g, '""')}"`
         ].join(',')).join('\n');
@@ -1803,6 +1884,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         volumeRatio: numOrUndefined('volumeRatio') ?? null,
                         sweepConfirmed: boolOrNull('sweepConfirmed'),
                         fvgConfluence: boolOrNull('fvgConfluence'),
+                        confluenceScore: numOrUndefined('confluenceScore') ?? null,
                         tpMode: get('tpMode') || null,
                         extensionRatioUsed: numOrUndefined('extensionRatioUsed') ?? null,
                         loggedAt: Date.parse(loggedAtStr) || Date.now(),
@@ -1938,7 +2020,10 @@ Respond ONLY with valid JSON, no extra text:
         const fvgText = trade.fvgConfluence
             ? `<span class="success">FVG confluence: yes</span>${trade.fvgRange ? ` (${trade.fvgRange.bottom.toFixed(6)}-${trade.fvgRange.top.toFixed(6)})` : ''}`
             : `<span class="muted">FVG confluence: no</span>`;
-        return `<div class="row">${sweepText} | ${fvgText}</div>`;
+        const scoreText = (trade.confluenceScore !== null && trade.confluenceScore !== undefined)
+            ? `<div class="row"><strong>Confluence score: ${trade.confluenceScore.toFixed(0)}%</strong>${trade.confluenceBreakdown ? ` - passed: ${trade.confluenceBreakdown.passed.join(', ') || 'none'}${trade.confluenceBreakdown.failed.length ? `; missing: ${trade.confluenceBreakdown.failed.join(', ')}` : ''}` : ''}</div>`
+            : '';
+        return `${scoreText}<div class="row">${sweepText} | ${fvgText}</div>`;
     }
 
     function renderTPModeSection(trade) {
@@ -1975,20 +2060,20 @@ Respond ONLY with valid JSON, no extra text:
     }
 
     function rankAndRerenderCards() {
-        const byVolumeDesc = (a, b) => (b.volumeRatio || 0) - (a.volumeRatio || 0);
-        lastValidTrades.longs.sort(byVolumeDesc);
-        lastValidTrades.shorts.sort(byVolumeDesc);
+        const byScoreDesc = (a, b) => (b.confluenceScore || 0) - (a.confluenceScore || 0);
+        lastValidTrades.longs.sort(byScoreDesc);
+        lastValidTrades.shorts.sort(byScoreDesc);
 
-        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts].sort(byVolumeDesc);
+        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts].sort(byScoreDesc);
         const cardsEl = document.getElementById('cards');
         cardsEl.innerHTML = '';
         all.forEach((trade, i) => {
             renderTradeCard(trade);
-            if (i === 0 && trade.volumeRatio) {
+            if (i === 0 && trade.confluenceScore) {
                 const lastCard = cardsEl.lastElementChild;
                 const badge = document.createElement('div');
                 badge.className = 'row success';
-                badge.innerHTML = '<strong>&#9733; Top pick this run (highest volume displacement)</strong>';
+                badge.innerHTML = `<strong>&#9733; Top pick this run (highest confluence score: ${trade.confluenceScore.toFixed(0)}%)</strong>`;
                 lastCard.prepend(badge);
             }
         });
@@ -2000,7 +2085,7 @@ Respond ONLY with valid JSON, no extra text:
         if (all.length === 0) return 'No valid trades found this run.';
         all.forEach((t, i) => {
             const orderTag = t.orderType ? `${t.orderType.toUpperCase()} @ ${t.entry}` : `Entry: ${t.entry}`;
-            lines.push(`${i + 1}. ${t.direction} ${t.symbol}${t.marketType === 'forex' ? ' [FX]' : ''} | ${orderTag} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Vol: ${t.volumeRatio ? t.volumeRatio.toFixed(2) + 'x' : 'n/a'} | ${t.notes}`);
+            lines.push(`${i + 1}. ${t.direction} ${t.symbol}${t.marketType === 'forex' ? ' [FX]' : ''} | ${orderTag} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Score: ${t.confluenceScore ? t.confluenceScore.toFixed(0) + '%' : 'n/a'} | Vol: ${t.volumeRatio ? t.volumeRatio.toFixed(2) + 'x' : 'n/a'} | ${t.notes}`);
         });
         return lines.join('\n');
     }
@@ -2054,7 +2139,7 @@ Respond ONLY with valid JSON, no extra text:
             };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, false, config.volumeDisplacementRatio);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, false, config.volumeDisplacementRatio);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
@@ -2121,6 +2206,8 @@ Respond ONLY with valid JSON, no extra text:
                 sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
                 fvgConfluence: !!filterResult.fvgMatch,
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
+                confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
+                confluenceBreakdown: filterResult.confluenceBreakdown || null,
                 tpMode: levels.tpMode,
                 extensionRatioUsed: levels.extensionRatio || null
             }
@@ -2181,7 +2268,7 @@ Respond ONLY with valid JSON, no extra text:
         }
 
         // skipVolumeCheck = true: forex has no centralized volume feed.
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.strictConfluence, true, config.volumeDisplacementRatio);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, true, config.volumeDisplacementRatio);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
@@ -2248,6 +2335,8 @@ Respond ONLY with valid JSON, no extra text:
                 sweepLevel: filterResult.sweep && filterResult.sweep.level !== null ? filterResult.sweep.level : null,
                 fvgConfluence: !!filterResult.fvgMatch,
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
+                confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
+                confluenceBreakdown: filterResult.confluenceBreakdown || null,
                 tpMode: levels.tpMode,
                 extensionRatioUsed: levels.extensionRatio || null
             }
