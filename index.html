@@ -130,6 +130,10 @@
             <label for="minRRFloor">Min RR floor (used when TP Mode = Fibonacci Extension)</label>
             <input type="number" id="minRRFloor" value="2.5" min="1" step="0.1">
         </div>
+        <div>
+            <label for="slBufferRatio">SL buffer (% of swing leg, beyond structure)</label>
+            <input type="number" id="slBufferRatio" value="10" min="1" max="100" step="1">
+        </div>
         <div id="cryptoCandidateNote">
             <label for="candidateCount">Candidates per side (max)</label>
             <input type="number" id="candidateCount" value="10" min="1" max="25">
@@ -225,14 +229,16 @@
 </details>
 
 <details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
-    <summary><strong>Settings Sweep (no API key needed)</strong> - tests many symbols, RR values, and confluence thresholds in one run</summary>
-    <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value AND every minimum confluence score you list against those same trades - so instead of guessing at a threshold, you get a grid comparing every combination side-by-side on a real sample size. Confluence weights come from the Settings panel above; this sweeps the pass/fail threshold, not the weights themselves.</p>
+    <summary><strong>Settings Sweep (no API key needed)</strong> - tests many symbols, RR values, confluence thresholds, and SL buffer sizes in one run</summary>
+    <p class="muted">Runs the same deterministic local-filter logic as the single backtest above, but fetches candles for every symbol you list ONCE and then replays every RR value, every minimum confluence score, AND every SL buffer size you list against those same trades - so instead of guessing at a threshold, you get a grid comparing every combination side-by-side on a real sample size. Confluence weights come from the Settings panel above; this sweeps the pass/fail threshold and stop placement, not the weights themselves. SL buffer size matters because the modeled trading cost is a fixed % of price - a tight stop turns that fixed cost into a large chunk of the trade's R, so widening the buffer is the main lever for finding out whether a combo is unprofitable due to no edge, or just due to stops sitting too close to entry.</p>
     <label for="batchSymbols">Symbols (comma-separated; Binance USDT pairs for crypto, or Twelve Data pairs like EUR/USD for forex)</label>
     <input type="text" id="batchSymbols" value="BTC,ETH,SOL,BNB,XRP,ADA,DOGE,LINK,AVAX,DOT,LTC,BCH">
     <label for="batchRRValues">RR values to test (comma-separated)</label>
     <input type="text" id="batchRRValues" value="1.5,2,2.5,3,3.5,4">
     <label for="batchScoreValues">Min confluence score values to test (comma-separated, 0-100)</label>
     <input type="text" id="batchScoreValues" value="40,50,60,70,80">
+    <label for="batchBufferValues">SL buffer % values to test (comma-separated, % of swing leg beyond structure)</label>
+    <input type="text" id="batchBufferValues" value="10,15,20,25,30">
     <button id="batchBacktestBtn" onclick="runBatchBacktest()">Run Settings Sweep</button>
     <div id="batchBacktestResults" style="margin-top:8px; overflow-x:auto;"></div>
     <div id="batchBacktestLog" style="margin-top:8px; white-space:pre-wrap; background:#f9f9f9; padding:8px; border-radius:5px; font-size:12px; max-height:220px; overflow:auto;"></div>
@@ -264,7 +270,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -311,6 +317,7 @@
             tpMode: document.getElementById('tpMode').value,
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
             minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
+            slBufferRatio: Math.min(1, Math.max(0.01, (parseFloat(document.getElementById('slBufferRatio').value) || 10) / 100)),
             displayTimezone: document.getElementById('displayTimezone').value,
             forexPairs: document.getElementById('forexPairs').value.split(',').map(s => s.trim()).filter(Boolean)
         };
@@ -743,9 +750,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     const STRUCTURAL_BUFFER_RATIO = 0.10;
 
-    function computeTradeLevels(direction, entry, swing, targetRR) {
+    function computeTradeLevels(direction, entry, swing, targetRR, slBufferRatio = STRUCTURAL_BUFFER_RATIO) {
         const legSize = swing.high - swing.low;
-        const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
+        const structuralBuffer = legSize * slBufferRatio;
 
         if (direction === 'bullish') {
             const sl = swing.low - structuralBuffer;
@@ -780,7 +787,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     function computeAdaptiveTradeLevels(direction, entry, swing, config) {
         const legSize = swing.high - swing.low;
-        const structuralBuffer = legSize * STRUCTURAL_BUFFER_RATIO;
+        const structuralBuffer = legSize * (config.slBufferRatio ?? STRUCTURAL_BUFFER_RATIO);
 
         let sl, risk;
         if (direction === 'bullish') {
@@ -1222,7 +1229,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1241,7 +1248,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 const currentPrice = bar.close;
                 const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio);
                 if (filterResult.pass) {
-                    const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR);
+                    const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR, slBufferRatio);
                     if (levels) {
                         const result = simulateTradeOutcome(ltfKlines, i, direction, levels, maxHoldBars);
                         trades.push({
@@ -1363,8 +1370,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             if (marketType === 'forex') btLogFn(`Forex mode: volume displacement check is auto-passed (no real volume data for FX).`);
             btLogFn(`Replaying local filter logic bar-by-bar (no Gemini) | confluence score threshold: ${config.minConfluenceScore}%${config.killzoneOnly ? ' | KILL ZONE ONLY: new signals restricted to London/NY session windows' : ' - kill zone restriction is OFF in Settings'}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
 
@@ -1474,6 +1481,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
         )).sort((a, b) => a - b);
     }
 
+    function parseBufferList(raw) {
+        return Array.from(new Set(
+            raw.split(',').map(s => parseFloat(s.trim())).filter(v => !isNaN(v) && v > 0 && v <= 100)
+        )).sort((a, b) => a - b);
+    }
+
     async function runBatchBacktest() {
         const btn = document.getElementById('batchBacktestBtn');
         const logEl = document.getElementById('batchBacktestLog');
@@ -1495,10 +1508,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
             : parseSymbolList(document.getElementById('batchSymbols').value);
         const rrValues = parseRRList(document.getElementById('batchRRValues').value);
         const scoreValues = parseScoreList(document.getElementById('batchScoreValues').value);
+        const bufferValues = parseBufferList(document.getElementById('batchBufferValues').value);
 
         if (symbols.length === 0) { blog('Enter at least one symbol.', 'error'); return; }
         if (rrValues.length === 0) { blog('Enter at least one valid RR value.', 'error'); return; }
         if (scoreValues.length === 0) { blog('Enter at least one valid confluence score (0-100).', 'error'); return; }
+        if (bufferValues.length === 0) { blog('Enter at least one valid SL buffer % (1-100).', 'error'); return; }
         if (marketType === 'forex' && !twelveDataKey) { blog('Enter your Twelve Data API key above to batch-backtest forex pairs.', 'error'); return; }
 
         const maxHoldBars = 288;
@@ -1525,24 +1540,27 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 return;
             }
 
-            blog(`\nTesting ${rrValues.length} RR value(s) x ${scoreValues.length} confluence score threshold(s) = ${rrValues.length * scoreValues.length} combinations across ${symbolData.length} symbol(s)`
+            blog(`\nTesting ${rrValues.length} RR value(s) x ${scoreValues.length} confluence score threshold(s) x ${bufferValues.length} SL buffer size(s) = ${rrValues.length * scoreValues.length * bufferValues.length} combinations across ${symbolData.length} symbol(s)`
                 + `${config.killzoneOnly ? ' | KILL ZONE ONLY ON' : ' | kill zone restriction OFF'}`
                 + `${marketType === 'forex' ? ' | volume check auto-passed (forex)' : ''}`
                 + ` (confluence weights taken from the Settings panel above)...\n`);
 
             const sweepResults = [];
-            scoreValues.forEach(score => {
-                rrValues.forEach(rr => {
-                    let allTrades = [];
-                    let longCount = 0, shortCount = 0;
-                    symbolData.forEach(({ klines1h, klines5m }) => {
-                        const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-                        const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio);
-                        longCount += longTrades.length;
-                        shortCount += shortTrades.length;
-                        allTrades = allTrades.concat(longTrades, shortTrades);
+            bufferValues.forEach(bufferPct => {
+                const slBufferRatio = bufferPct / 100;
+                scoreValues.forEach(score => {
+                    rrValues.forEach(rr => {
+                        let allTrades = [];
+                        let longCount = 0, shortCount = 0;
+                        symbolData.forEach(({ klines1h, klines5m }) => {
+                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio);
+                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio);
+                            longCount += longTrades.length;
+                            shortCount += shortTrades.length;
+                            allTrades = allTrades.concat(longTrades, shortTrades);
+                        });
+                        sweepResults.push({ score, rr, bufferPct, longCount, shortCount, stats: summarizeBacktest(allTrades), trades: allTrades });
                     });
-                    sweepResults.push({ score, rr, longCount, shortCount, stats: summarizeBacktest(allTrades), trades: allTrades });
                 });
             });
 
@@ -1555,6 +1573,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         <tr style="text-align:left; border-bottom:2px solid #ddd;">
                             <th style="padding:4px;">Score</th>
                             <th style="padding:4px;">RR</th>
+                            <th style="padding:4px;">SL Buf</th>
                             <th style="padding:4px;">Signals (L/S)</th>
                             <th style="padding:4px;">W/L/Timeout</th>
                             <th style="padding:4px;">Win Rate</th>
@@ -1567,11 +1586,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     <tbody>
                         ${sweepResults.map(r => {
                             const s = r.stats;
-                            const isBest = bestByTotalR && r.rr === bestByTotalR.rr && r.score === bestByTotalR.score;
+                            const isBest = bestByTotalR && r.rr === bestByTotalR.rr && r.score === bestByTotalR.score && r.bufferPct === bestByTotalR.bufferPct;
                             return `
                             <tr style="border-bottom:1px solid #eee; ${isBest ? 'background:#eaffea; font-weight:bold;' : ''}">
                                 <td style="padding:4px;">${r.score}%${isBest ? ' &#9733;' : ''}</td>
                                 <td style="padding:4px;">${r.rr}:1</td>
+                                <td style="padding:4px;">${r.bufferPct}%</td>
                                 <td style="padding:4px;">${s.count} (${r.longCount}/${r.shortCount})</td>
                                 <td style="padding:4px;">${s.wins}/${s.losses}/${s.timeouts}</td>
                                 <td style="padding:4px;">${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'}</td>
@@ -1587,16 +1607,16 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     const periodStartMs = Math.min(...symbolData.map(d => d.klines5m[0].closeTime));
                     const periodEndMs = Math.max(...symbolData.map(d => d.klines5m[d.klines5m.length - 1].closeTime));
                     const windows = regimeSplit(bestByTotalR.trades, periodStartMs, periodEndMs, 3);
-                    return `<div class="row" style="margin-top:8px;"><strong>Consistency check for the starred combo (score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1)</strong></div>${renderRegimeSplitTable(windows)}`;
+                    return `<div class="row" style="margin-top:8px;"><strong>Consistency check for the starred combo (score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 / SL buffer ${bestByTotalR.bufferPct}%)</strong></div>${renderRegimeSplitTable(windows)}`;
                 })() : ''}
             `;
 
             blog(`Done. Tested across ${symbolData.length} symbol(s): ${symbolData.map(d => d.symbol).join(', ')}.`, 'success');
             if (bestByTotalR) {
-                blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate). Raw R before modeled cost: ${bestByTotalR.stats.totalRawR.toFixed(2)} | cost paid: ${bestByTotalR.stats.totalFrictionR.toFixed(2)}R (avg ${bestByTotalR.stats.avgFrictionR.toFixed(3)}R/trade).`, 'success');
+                blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 / SL buffer ${bestByTotalR.bufferPct}% (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate). Raw R before modeled cost: ${bestByTotalR.stats.totalRawR.toFixed(2)} | cost paid: ${bestByTotalR.stats.totalFrictionR.toFixed(2)}R (avg ${bestByTotalR.stats.avgFrictionR.toFixed(3)}R/trade).`, 'success');
                 if (bestByTotalR.stats.totalR <= 0) {
                     if (bestByTotalR.stats.totalRawR > 0) {
-                        blog(`Notable: this combo's raw R (before cost) is positive (${bestByTotalR.stats.totalRawR.toFixed(2)}) but modeled friction/slippage (${bestByTotalR.stats.totalFrictionR.toFixed(2)}R) pushes it negative. That points to the stops being too tight relative to price for the cost model, not necessarily "no edge" - worth widening the structural SL buffer or trading pairs/timeframes where stops sit further from entry before concluding this setup doesn't work.`, 'error');
+                        blog(`Notable: this combo's raw R (before cost) is positive (${bestByTotalR.stats.totalRawR.toFixed(2)}) but modeled friction/slippage (${bestByTotalR.stats.totalFrictionR.toFixed(2)}R) pushes it negative. Check whether total R trends upward as SL buffer % increases in the table above - if so, stops are still too tight for the cost model even at the best row here, and it's worth testing even wider buffer values before concluding this setup doesn't work.`, 'error');
                     } else {
                         blog(`Heads up: even the best combination here is negative before AND after cost. That means nothing in this grid has demonstrated edge yet on this data - widening the symbol list, the score/RR ranges, or the history window is more useful right now than picking a "winner" from this table.`, 'error');
                     }
