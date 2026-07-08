@@ -1208,18 +1208,18 @@ After searching, respond with ONLY this JSON object and no other text before or 
         for (let j = entryIndex + 1; j <= endIndex; j++) {
             const bar = ltfKlines[j];
             if (direction === 'bullish') {
-                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, exitIndex: j };
-                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, exitIndex: j };
+                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
+                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, frictionR, exitIndex: j };
             } else {
-                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, exitIndex: j };
-                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, exitIndex: j };
+                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
+                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, frictionR, exitIndex: j };
             }
         }
         const lastClose = ltfKlines[endIndex].close;
         const rrAchievedRaw = direction === 'bullish'
             ? (lastClose - levels.entry) / riskPerUnit
             : (levels.entry - lastClose) / riskPerUnit;
-        return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, exitIndex: endIndex };
+        return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, frictionR, exitIndex: endIndex };
     }
 
     function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio) {
@@ -1248,7 +1248,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                             entryIndex: i,
                             entryTime: bar.closeTime,
                             entry: levels.entry, sl: levels.sl, tp: levels.tp,
-                            outcome: result.outcome, rrAchieved: result.rrAchieved
+                            outcome: result.outcome, rrAchieved: result.rrAchieved, frictionR: result.frictionR
                         });
                         i = result.exitIndex + 1;
                         continue;
@@ -1262,13 +1262,21 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     function summarizeBacktest(trades) {
         if (trades.length === 0) {
-            return { count: 0, wins: 0, losses: 0, timeouts: 0, winRate: null, avgRR: null, maxDrawdownR: 0, totalR: 0 };
+            return { count: 0, wins: 0, losses: 0, timeouts: 0, winRate: null, avgRR: null, maxDrawdownR: 0, totalR: 0, totalFrictionR: 0, avgFrictionR: 0, totalRawR: 0 };
         }
         const wins = trades.filter(t => t.outcome === 'win').length;
         const losses = trades.filter(t => t.outcome === 'loss').length;
         const timeouts = trades.filter(t => t.outcome === 'timeout').length;
         const decided = wins + losses;
         const totalR = trades.reduce((sum, t) => sum + t.rrAchieved, 0);
+        // frictionR is subtracted from every trade's rrAchieved at simulation
+        // time to model fees/slippage. That's realistic, but it's a fixed %
+        // of PRICE divided by a variable $ stop distance - so tight-stop
+        // trades quietly pay a much bigger R-cost than wide-stop ones. Report
+        // it separately so a losing result isn't mistaken for "no edge" when
+        // it's actually "edge partly or fully eaten by cost on tight stops."
+        const totalFrictionR = trades.reduce((sum, t) => sum + (t.frictionR || 0), 0);
+        const totalRawR = totalR + totalFrictionR;
 
         let equity = 0, peak = 0, maxDD = 0;
         trades.forEach(t => {
@@ -1282,7 +1290,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
             winRate: decided > 0 ? (wins / decided) * 100 : null,
             avgRR: totalR / trades.length,
             maxDrawdownR: maxDD,
-            totalR
+            totalR,
+            totalFrictionR,
+            avgFrictionR: totalFrictionR / trades.length,
+            totalRawR
         };
     }
 
@@ -1361,7 +1372,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 if (s.count === 0) return `${label}: 0 signals in this window.`;
                 return `${label}: ${s.count} signals | ${s.wins}W / ${s.losses}L / ${s.timeouts} timed out | `
                     + `win rate (decided trades): ${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'} | `
-                    + `avg R per trade: ${s.avgRR.toFixed(2)} | total R: ${s.totalR.toFixed(2)} | max drawdown: ${s.maxDrawdownR.toFixed(2)}R`;
+                    + `avg R per trade: ${s.avgRR.toFixed(2)} | total R: ${s.totalR.toFixed(2)} | max drawdown: ${s.maxDrawdownR.toFixed(2)}R | `
+                    + `raw R before cost: ${s.totalRawR.toFixed(2)} | friction/slippage cost: ${s.totalFrictionR.toFixed(2)}R (avg ${s.avgFrictionR.toFixed(3)}R/trade)`;
             }
 
             btLogFn(fmtStats('LONGS', longStats), 'success');
@@ -1377,6 +1389,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''}, ${config.backtestHistoryDays}d history)</strong></div>
                 <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
                 <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max drawdown</div>
+                <div class="row muted">Raw R before friction/slippage: ${(longStats.totalRawR + shortStats.totalRawR).toFixed(2)} | Modeled cost: ${(longStats.totalFrictionR + shortStats.totalFrictionR).toFixed(2)}R total (avg ${((longStats.totalFrictionR + shortStats.totalFrictionR) / Math.max(1, longStats.count + shortStats.count)).toFixed(3)}R/trade) - a setup can have a real raw edge that's still being eaten by cost on tight stops, so check this line before writing off the setup entirely.</div>
                 ${renderRegimeSplitTable(windows)}
             `;
         } catch (e) {
@@ -1546,6 +1559,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                             <th style="padding:4px;">W/L/Timeout</th>
                             <th style="padding:4px;">Win Rate</th>
                             <th style="padding:4px;">Avg R</th>
+                            <th style="padding:4px;">Friction/tr</th>
                             <th style="padding:4px;">Total R</th>
                             <th style="padding:4px;">Max DD</th>
                         </tr>
@@ -1562,6 +1576,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
                                 <td style="padding:4px;">${s.wins}/${s.losses}/${s.timeouts}</td>
                                 <td style="padding:4px;">${s.winRate !== null ? s.winRate.toFixed(1) + '%' : 'n/a'}</td>
                                 <td style="padding:4px;">${s.avgRR !== null ? s.avgRR.toFixed(2) : 'n/a'}</td>
+                                <td style="padding:4px;">${s.avgFrictionR.toFixed(3)}</td>
                                 <td style="padding:4px;">${s.totalR.toFixed(2)}</td>
                                 <td style="padding:4px;">${s.maxDrawdownR.toFixed(2)}R</td>
                             </tr>`;
@@ -1578,9 +1593,13 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             blog(`Done. Tested across ${symbolData.length} symbol(s): ${symbolData.map(d => d.symbol).join(', ')}.`, 'success');
             if (bestByTotalR) {
-                blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate).`, 'success');
+                blog(`Highest total R: score ${bestByTotalR.score}% / RR ${bestByTotalR.rr}:1 (${bestByTotalR.stats.count} combined signals, ${bestByTotalR.stats.totalR.toFixed(2)}R total, ${bestByTotalR.stats.winRate !== null ? bestByTotalR.stats.winRate.toFixed(1) + '%' : 'n/a'} win rate). Raw R before modeled cost: ${bestByTotalR.stats.totalRawR.toFixed(2)} | cost paid: ${bestByTotalR.stats.totalFrictionR.toFixed(2)}R (avg ${bestByTotalR.stats.avgFrictionR.toFixed(3)}R/trade).`, 'success');
                 if (bestByTotalR.stats.totalR <= 0) {
-                    blog(`Heads up: even the best combination here is flat or net negative in R. That means nothing in this grid has demonstrated edge yet on this data - widening the symbol list, the score/RR ranges, or the history window is more useful right now than picking a "winner" from this table.`, 'error');
+                    if (bestByTotalR.stats.totalRawR > 0) {
+                        blog(`Notable: this combo's raw R (before cost) is positive (${bestByTotalR.stats.totalRawR.toFixed(2)}) but modeled friction/slippage (${bestByTotalR.stats.totalFrictionR.toFixed(2)}R) pushes it negative. That points to the stops being too tight relative to price for the cost model, not necessarily "no edge" - worth widening the structural SL buffer or trading pairs/timeframes where stops sit further from entry before concluding this setup doesn't work.`, 'error');
+                    } else {
+                        blog(`Heads up: even the best combination here is negative before AND after cost. That means nothing in this grid has demonstrated edge yet on this data - widening the symbol list, the score/RR ranges, or the history window is more useful right now than picking a "winner" from this table.`, 'error');
+                    }
                 }
             } else {
                 blog('No signals triggered for any combination in this window - try lowering the confluence score values, loosening Kill Zone Only in Settings, or widen the symbol list.', 'error');
