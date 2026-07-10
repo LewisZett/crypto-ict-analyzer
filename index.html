@@ -820,10 +820,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function classifyKillZone(utcHour, utcMinute) {
         // DST-aware kill zone detection
         // London Kill Zone: 08:00-10:00 London local time (shifts with DST)
-        // NY Kill Zone: 13:00-15:00 EST (08:00-10:00 EST local) (shifts with DST)
+        // NY Kill Zone: 08:00-10:00 NY local time (shifts with DST)
         
         const now = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate(), utcHour, utcMinute));
-        const offset = getDSTOffset(now);
         
         // London opens 08:00 local (07:00 UTC during GMT, 08:00 UTC during BST after adjustment)
         // During GMT (Nov-Mar): London 08:00 = 08:00 UTC
@@ -834,7 +833,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const londonKZEndUTC = 10 - londonDSTOffset;
         const isLKZ = utcHour >= londonKZStartUTC && utcHour < londonKZEndUTC;
         
-        // NY opens 13:00 EST (08:00 EST = 13:00 UTC during EST)
+        // NY opens 08:00 EST/EDT local (13:00 UTC during EST, 12:00 UTC during EDT)
         // During EST (Nov-Mar): NY 08:00 = 13:00 UTC
         // During EDT (Mar-Nov): NY 08:00 = 12:00 UTC
         // Kill zone: 08:00-10:00 NY local (or 13:00-15:00 UTC EST, 12:00-14:00 UTC EDT)
