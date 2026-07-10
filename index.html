@@ -997,7 +997,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function checkStaleness(klines, interval) {
         if (!klines || klines.length === 0) return { stale: true, ageMs: Infinity };
         const lastCloseTime = klines[klines.length - 1].closeTime;
-        const ageMs = Date.now() - lastCloseTime;
+        // The most recent kline from Binance is often still in progress (not yet
+        // closed), so its closeTime can be a few minutes in the future. Clamp to 0
+        // so freshness never displays as a nonsensical negative number - a
+        // negative value here just means "still live", not "stale".
+        const ageMs = Math.max(0, Date.now() - lastCloseTime);
         const limit = STALENESS_LIMITS_MS[interval] || 30 * 60 * 1000;
         return { stale: ageMs > limit, ageMs };
     }
@@ -2050,6 +2054,7 @@ Respond ONLY with valid JSON:
             ${renderOrderTypeSection(trade)}
             <div class="row">Entry: ${trade.entry} | SL: ${trade.sl} | TP: ${trade.tp} | RR: ${(typeof trade.rr === 'number' ? trade.rr.toFixed(2) : trade.rr)}:1</div>
             ${renderTPModeSection(trade)}
+            ${renderCandleConfirmSection(trade)}
             ${renderSpreadSection(trade)}
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence}</div>
@@ -2199,6 +2204,160 @@ Respond ONLY with valid JSON:
     }
 
     // ------------------------------------------------------------------
+    // Candle-close confirmation + full structure revalidation (market orders only)
+    // ------------------------------------------------------------------
+    // Binance/Twelve Data both return the currently-forming candle as the
+    // last item in a klines request. For a LIMIT order the exact timing
+    // doesn't matter - the resting order fills whenever price reaches the
+    // level. For a MARKET order it matters a lot: entering while the
+    // triggering candle is still open means acting on a wick that hasn't
+    // been accepted yet, which is a much bigger problem on a no-stop-loss,
+    // 10x position than on a normal stopped-out trade.
+    //
+    // "Revalidate" does not do a simplified sweep-level check - it re-fetches
+    // fresh candles and re-runs the SAME passesLocalFilter() engine used for
+    // the original signal (MA trend, HH/HL structure, OTE zone, liquidity
+    // sweep, FVG, volume displacement, confluence score threshold). If the
+    // freshest closed candle no longer clears the bar, this says so plainly.
+    function getCandleCloseInfo(candlesLTF) {
+        if (!candlesLTF || candlesLTF.length === 0) return null;
+        const last = candlesLTF[candlesLTF.length - 1];
+        const msRemaining = last.closeTime - Date.now();
+        return {
+            closeTime: last.closeTime,
+            closed: msRemaining <= 0,
+            secondsRemaining: Math.max(0, Math.round(msRemaining / 1000)),
+            lastClose: last.close
+        };
+    }
+
+    function candleElId(symbol, direction) {
+        return `candle-${String(symbol).replace(/[^a-zA-Z0-9]/g, '_')}-${direction}`;
+    }
+
+    function candleConfirmInnerHTML(trade) {
+        const info = trade.candleCloseInfo;
+        const reval = trade.revalidation;
+
+        if (!info) {
+            return `<div class="muted">Candle status unavailable.</div>
+                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate structure</button>`;
+        }
+
+        // Candle still forming - a revalidation run now would just be judging
+        // an incomplete candle, so don't pretend to have a verdict yet.
+        if (!info.closed) {
+            return `
+                <div style="border-left:3px solid #f5a623; padding-left:8px;">
+                    <div style="font-weight:bold; color:#f5a623;">&#8987; CANDLE STILL FORMING - wait ~${info.secondsRemaining}s before entering at market</div>
+                    <div class="muted">Entering now risks acting on a wick that hasn't been accepted yet. Revalidation will run once this candle closes.</div>
+                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Check again</button>
+                </div>
+            `;
+        }
+
+        if (!reval) {
+            return `
+                <div style="border-left:3px solid #28a745; padding-left:8px;">
+                    <div style="font-weight:bold; color:#28a745;">&#9989; CANDLE CLOSED - not yet revalidated</div>
+                    <div class="muted">Click below to re-run the full structure/OTE/FVG/sweep check on the closed candle before entering.</div>
+                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate structure</button>
+                </div>
+            `;
+        }
+
+        const checkedTime = new Date(reval.checkedAt).toLocaleTimeString();
+        if (!reval.pass) {
+            return `
+                <div style="border-left:3px solid #dc3545; padding-left:8px;">
+                    <div style="font-weight:bold; color:#dc3545;">&#10060; STRUCTURE NO LONGER VALID - do not enter at market</div>
+                    <div class="muted">${reval.reason}</div>
+                    <div class="muted">Revalidated at ${checkedTime} (price then: ${reval.currentPrice})</div>
+                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate again</button>
+                </div>
+            `;
+        }
+        const breakdown = reval.confluenceBreakdown
+            ? ` - passed: ${reval.confluenceBreakdown.passed.join(', ') || 'none'}${reval.confluenceBreakdown.failed.length ? `; missing: ${reval.confluenceBreakdown.failed.join(', ')}` : ''}`
+            : '';
+        return `
+            <div style="border-left:3px solid #28a745; padding-left:8px;">
+                <div style="font-weight:bold; color:#28a745;">&#9989; STRUCTURE RECONFIRMED - fresh confluence ${reval.confluenceScore.toFixed(0)}%${breakdown}</div>
+                <div class="muted">Sweep: ${reval.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${reval.fvgConfluence ? 'yes' : 'no'}</div>
+                <div class="muted">Revalidated at ${checkedTime} (price then: ${reval.currentPrice})</div>
+                <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate again</button>
+            </div>
+        `;
+    }
+
+    function renderCandleConfirmSection(trade) {
+        if (trade.orderType !== 'market') return '';
+        return `<div class="row" id="${candleElId(trade.symbol, trade.direction)}">${candleConfirmInnerHTML(trade)}</div>`;
+    }
+
+    async function revalidateStructure(symbol, direction, marketType) {
+        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
+        const trade = all.find(t => t.symbol === symbol && t.direction === direction);
+        if (!trade) return;
+        const el = document.getElementById(candleElId(symbol, direction));
+        if (el) el.innerHTML = '<div class="muted">Revalidating structure...</div>';
+        try {
+            let candles;
+            if (marketType === 'crypto') {
+                candles = await fetchCoinCandles({ symbol }, undefined);
+            } else {
+                const tdKey = document.getElementById('twelveDataKey').value.trim();
+                candles = await fetchForexCandles(symbol, tdKey, undefined);
+            }
+            if (!candles.ok) {
+                if (el) el.innerHTML = `<div class="error">Revalidation failed: could not fetch fresh candles.</div>
+                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${symbol}','${direction}','${marketType}')">&#128260; Try again</button>`;
+                return;
+            }
+
+            trade.candleCloseInfo = getCandleCloseInfo(candles.candlesLTF);
+
+            // Still forming - don't run the filter against an incomplete candle.
+            if (!trade.candleCloseInfo || !trade.candleCloseInfo.closed) {
+                trade.revalidation = null;
+                if (el) el.innerHTML = candleConfirmInnerHTML(trade);
+                return;
+            }
+
+            const config = getConfig();
+            const dir = trade.direction === 'Long' ? 'bullish' : 'bearish';
+            const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
+            const skipVolumeCheck = marketType === 'forex';
+            const filterResult = passesLocalFilter(
+                candles.closesHTF, candles.candlesLTF, currentPrice, dir,
+                config.confluenceWeights, config.minConfluenceScore, skipVolumeCheck, config.volumeDisplacementRatio
+            );
+
+            trade.revalidation = filterResult.pass
+                ? {
+                    pass: true,
+                    confluenceScore: filterResult.confluenceScore,
+                    confluenceBreakdown: filterResult.confluenceBreakdown,
+                    sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
+                    fvgConfluence: !!filterResult.fvgMatch,
+                    currentPrice: currentPrice.toFixed(6),
+                    checkedAt: Date.now()
+                }
+                : {
+                    pass: false,
+                    reason: filterResult.reason,
+                    currentPrice: currentPrice.toFixed(6),
+                    checkedAt: Date.now()
+                };
+
+            if (el) el.innerHTML = candleConfirmInnerHTML(trade);
+        } catch (e) {
+            if (el) el.innerHTML = `<div class="error">Revalidation error: ${e.message}</div>
+                <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${symbol}','${direction}','${marketType}')">&#128260; Try again</button>`;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Per-candidate analysis - CRYPTO
     // ------------------------------------------------------------------
     const CORRELATION_CAP = 3;
@@ -2329,6 +2488,7 @@ Respond ONLY with valid JSON:
                 marketType: 'crypto',
                 name: coin.name, symbol,
                 spreadCheck,
+                candleCloseInfo: orderInfo.type === 'market' ? getCandleCloseInfo(candles.candlesLTF) : null,
                 entry: levels.entry.toFixed(6), sl: levels.sl.toFixed(6), tp: levels.tp.toFixed(6),
                 rr: levels.rr,
                 units: sizing.units.toFixed(4), positionUSD: sizing.positionUSD.toFixed(2), riskAmount: sizing.riskAmount.toFixed(2),
@@ -2407,6 +2567,7 @@ Respond ONLY with valid JSON:
                 marketType: 'forex',
                 name: pair, symbol: pair,
                 spreadCheck: { available: false, reason: 'Bid/ask spread not available via the Twelve Data free-tier quote endpoint' },
+                candleCloseInfo: orderInfo.type === 'market' ? getCandleCloseInfo(candles.candlesLTF) : null,
                 entry: levels.entry.toFixed(6), sl: levels.sl.toFixed(6), tp: levels.tp.toFixed(6),
                 rr: levels.rr,
                 units: sizing.units.toFixed(4), positionUSD: sizing.positionUSD.toFixed(2), riskAmount: sizing.riskAmount.toFixed(2),
