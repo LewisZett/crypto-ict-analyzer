@@ -634,6 +634,46 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fvgs.find(g => price >= g.bottom && price <= g.top) || null;
     }
 
+    function detectDualWicks(candlesLTF, swing, direction) {
+        // Dual-wick flag: both upper and lower wicks touch swing extremes on same candle
+        // This indicates liquidity was swept on both sides, high confirmation of reversal
+        if (!candlesLTF || candlesLTF.length === 0) return { detected: false, strength: 0 };
+        
+        const recent = candlesLTF.slice(-20); // Check last 20 candles
+        let maxStrength = 0;
+        let dualWickCandleIndex = -1;
+        
+        for (let i = 0; i < recent.length; i++) {
+            const candle = recent[i];
+            const wickLow = Math.min(candle.open, candle.close);
+            const wickHigh = Math.max(candle.open, candle.close);
+            
+            // Check if both wicks are within 2% of swing extremes
+            const swingRange = swing.high - swing.low;
+            const tolerance = swingRange * 0.02;
+            
+            const touchesLow = Math.abs(candle.low - swing.low) < tolerance;
+            const touchesHigh = Math.abs(candle.high - swing.high) < tolerance;
+            
+            if (touchesLow && touchesHigh) {
+                // Dual wick detected - stronger if it's more recent
+                const recency = (recent.length - i) / recent.length;
+                const strength = recency; // Recent dual wicks weighted higher
+                if (strength > maxStrength) {
+                    maxStrength = strength;
+                    dualWickCandleIndex = i;
+                }
+            }
+        }
+        
+        return { 
+            detected: dualWickCandleIndex >= 0, 
+            strength: maxStrength,
+            candleIndex: dualWickCandleIndex,
+            signal: dualWickCandleIndex >= 0 ? 'Both swing extremes tested on single candle - high reversal confirmation' : null
+        };
+    }
+
     function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
@@ -654,6 +694,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
         const volCheck = skipVolumeCheck ? null : checkVolumeDisplacement(volumesLTF, volumeDisplacementRatio);
         const sweep = detectLiquiditySweep(candlesLTF, direction);
+        const dualWicks = detectDualWicks(candlesLTF, swing, direction);
         const fvgs = findFVGs(candlesLTF.slice(-60), direction);
         const fvgMatch = findFVGContainingPrice(currentPrice, fvgs);
 
@@ -680,8 +721,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
 
         return {
-            pass: true, sma, swing, volumeRatio: volCheck ? volCheck.ratio : null, sweep, fvgMatch,
-            confluenceScore: scorePct, confluenceBreakdown: { passed: passedLabels, failed: failedLabels }
+            pass: true, sma, swing, volumeRatio: volCheck ? volCheck.ratio : null, sweep, fvgMatch, dualWicks,
+            confluenceScore: scorePct, confluenceBreakdown: { passed: passedLabels, failed: failedLabels },
+            dualWickSignal: dualWicks.signal
         };
     }
 
@@ -776,10 +818,70 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     function classifyKillZone(utcHour, utcMinute) {
-        const isLKZ = utcHour >= 7 && utcHour < 10;
-        const isNYKZ = (utcHour === 13 && utcMinute >= 30) || utcHour === 14 || utcHour === 15;
+        // DST-aware kill zone detection
+        // London Kill Zone: 08:00-10:00 London local time (shifts with DST)
+        // NY Kill Zone: 13:00-15:00 EST (08:00-10:00 EST local) (shifts with DST)
+        
+        const now = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate(), utcHour, utcMinute));
+        const offset = getDSTOffset(now);
+        
+        // London opens 08:00 local (07:00 UTC during GMT, 08:00 UTC during BST after adjustment)
+        // During GMT (Nov-Mar): London 08:00 = 08:00 UTC
+        // During BST (Mar-Nov): London 08:00 = 07:00 UTC
+        // Kill zone: 08:00-10:00 London local
+        const londonDSTOffset = isDateInDSTPeriod(now, 'Europe/London') ? 1 : 0;
+        const londonKZStartUTC = 8 - londonDSTOffset; // 7 or 8 UTC depending on DST
+        const londonKZEndUTC = 10 - londonDSTOffset;
+        const isLKZ = utcHour >= londonKZStartUTC && utcHour < londonKZEndUTC;
+        
+        // NY opens 13:00 EST (08:00 EST = 13:00 UTC during EST)
+        // During EST (Nov-Mar): NY 08:00 = 13:00 UTC
+        // During EDT (Mar-Nov): NY 08:00 = 12:00 UTC
+        // Kill zone: 08:00-10:00 NY local (or 13:00-15:00 UTC EST, 12:00-14:00 UTC EDT)
+        const nyDSTOffset = isDateInDSTPeriod(now, 'America/New_York') ? -4 : -5;
+        const nyKZStartUTC = 8 - nyDSTOffset; // 12 or 13 UTC depending on DST
+        const nyKZEndUTC = 10 - nyDSTOffset;
+        const isNYKZ = (utcHour === nyKZStartUTC && utcMinute >= 0) || (utcHour > nyKZStartUTC && utcHour < nyKZEndUTC);
+        
+        // Asian session: typically 23:00 UTC - 07:00 UTC (Tokyo/Sydney times)
         const isAsian = utcHour >= 23 || utcHour < 7;
+        
         return { isLKZ, isNYKZ, isAsian, inKillZone: isLKZ || isNYKZ };
+    }
+
+    function isDateInDSTPeriod(date, timeZone) {
+        // Check if given date is in DST for the specified timezone
+        let start, end;
+        const year = date.getUTCFullYear();
+        
+        if (timeZone === 'Europe/London') {
+            // Last Sunday of March to last Sunday of October
+            start = getLastSundayOfMonth(year, 2); // March
+            end = getLastSundayOfMonth(year, 9); // October
+        } else if (timeZone === 'America/New_York') {
+            // 2nd Sunday of March to 1st Sunday of November
+            start = getNthSundayOfMonth(year, 2, 1); // March (2nd Sunday)
+            end = getNthSundayOfMonth(year, 10, 0); // November (1st Sunday)
+        }
+        
+        return date >= start && date < end;
+    }
+
+    function getNthSundayOfMonth(year, month, n) {
+        // n=0 is 1st Sunday, n=1 is 2nd Sunday, etc.
+        let date = new Date(Date.UTC(year, month, 1));
+        // Find first Sunday
+        while (date.getUTCDay() !== 0) date.setUTCDate(date.getUTCDate() + 1);
+        // Move to nth Sunday
+        date.setUTCDate(date.getUTCDate() + (n * 7));
+        return date;
+    }
+
+    function getLastSundayOfMonth(year, month) {
+        // Last Sunday of the month
+        let date = new Date(Date.UTC(year, month + 1, 0));
+        while (date.getUTCDay() !== 0) date.setUTCDate(date.getUTCDate() - 1);
+        return date;
     }
 
     function isTimestampInKillZone(timestampMs) {
@@ -1890,6 +1992,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
     function buildPrompt(coin, direction, currentPrice, filterResult, sessionInfo, change24h) {
         const dirLabel = direction === 'bullish' ? 'long' : 'short';
         const structureLabel = direction === 'bullish' ? 'HH/HL (higher highs, higher lows)' : 'LH/LL (lower highs, lower lows)';
+        const dualWickNote = filterResult.dualWickSignal 
+            ? `\nDual-Wick Signal: DETECTED - ${filterResult.dualWickSignal} (high reversal confirmation)\n`
+            : '';
         return `You are an expert ICT (Inner Circle Trader) analyst reviewing a pre-screened ${dirLabel} candidate.
 The following technical facts have already been computed and verified in code - treat them as ground truth:
 
@@ -1902,8 +2007,7 @@ Recent swing high: ${filterResult.swing.high}
 Recent swing low: ${filterResult.swing.low}
 Price is in the 61.8%-78.6% Fibonacci OTE retracement zone
 Liquidity sweep: ${filterResult.sweep && filterResult.sweep.swept ? `CONFIRMED - wicked through prior swing at ${filterResult.sweep.level} and closed back through` : 'not confirmed'}
-FVG confluence: ${filterResult.fvgMatch ? `price inside unmitigated FVG (${filterResult.fvgMatch.bottom.toFixed(6)}-${filterResult.fvgMatch.top.toFixed(6)})` : 'no FVG overlapping price'}
-Session: ${sessionInfo.summary}
+FVG confluence: ${filterResult.fvgMatch ? `price inside unmitigated FVG (${filterResult.fvgMatch.bottom.toFixed(6)}-${filterResult.fvgMatch.top.toFixed(6)})` : 'no FVG overlapping price'}${dualWickNote}Session: ${sessionInfo.summary}
 
 Judge context and confidence only - do not invent price levels:
 - Does session timing support this setup?
@@ -1993,6 +2097,9 @@ Respond ONLY with valid JSON:
         const cls = trade.direction === 'Long' ? 'long' : 'short';
         const div = document.createElement('div');
         div.className = `card ${cls}`;
+        const dualWickHTML = trade.dualWickSignal 
+            ? `<div class="row success"><strong>✓ Dual-wick: ${trade.dualWickSignal}</strong></div>`
+            : '';
         div.innerHTML = `
             <h3>${trade.name} (${trade.symbol})${trade.marketType === 'forex' ? ' [FX]' : ''} - ${trade.direction}</h3>
             ${renderOrderTypeSection(trade)}
@@ -2002,6 +2109,7 @@ Respond ONLY with valid JSON:
             <div class="row">AI context read (unvalidated): ${trade.confidence}</div>
             ${renderVolumeSection(trade)}
             ${renderConfluenceSection(trade)}
+            ${dualWickHTML}
             <div class="row muted">${trade.notes}</div>
             <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
             ${renderNewsSection(trade.newsCheck)}
@@ -2050,12 +2158,64 @@ Respond ONLY with valid JSON:
     // ------------------------------------------------------------------
     // Per-candidate analysis - CRYPTO
     // ------------------------------------------------------------------
+    const CORRELATION_CAP = 3; // Max correlated positions in journal at once
+
+    function getCorrelationFamily(symbol, marketType) {
+        // Group symbols by correlation family
+        if (marketType === 'crypto') {
+            // BTC is the anchor - everything else is altcoin
+            if (symbol.toUpperCase() === 'BTC') return 'btc';
+            return 'alts'; // All alts highly correlated with each other during flush
+        } else {
+            // Forex: USD pairs are correlated with each other, non-USD pairs separate
+            const parts = symbol.split('/');
+            if (parts[0] === 'USD' || parts[1] === 'USD') return 'usd-pairs';
+            return 'non-usd-pairs';
+        }
+    }
+
+    function checkCorrelationSafety(newSymbol, newMarketType, newDirection) {
+        // Read from journal to get active positions
+        const journal = loadJournal();
+        const activePositions = journal.filter(entry => {
+            return entry.status === 'open' || entry.status === undefined; // Entries still in journal and unresolved
+        });
+
+        // Group active positions by correlation family
+        const familyMap = {};
+        for (const pos of activePositions) {
+            const family = getCorrelationFamily(pos.symbol, pos.marketType);
+            if (!familyMap[family]) familyMap[family] = [];
+            familyMap[family].push(pos);
+        }
+
+        // Check if new position's family would exceed cap
+        const newFamily = getCorrelationFamily(newSymbol, newMarketType);
+        const familyCount = (familyMap[newFamily] || []).length;
+
+        if (familyCount >= CORRELATION_CAP) {
+            const existingSymbols = familyMap[newFamily].map(p => p.symbol).join(', ');
+            return {
+                safe: false,
+                reason: `Correlation cap (${CORRELATION_CAP}) would be exceeded for ${newFamily} group. Active: ${existingSymbols}`
+            };
+        }
+
+        return { safe: true };
+    }
+
     async function analyzeCandidate(coin, direction, config, sessionInfo, apiKey, signal) {
         const symbol = coin.symbol.toUpperCase();
         const change24h = coin.price_change_percentage_24h.toFixed(2);
 
         if (Math.abs(coin.price_change_percentage_24h) > 50) {
             return { success: false, reason: 'Extreme 24h volatility (>50%) - likely data anomaly' };
+        }
+
+        // Check correlation safety before doing expensive API calls
+        const correlationCheck = checkCorrelationSafety(symbol, 'crypto', direction);
+        if (!correlationCheck.safe) {
+            return { success: false, reason: correlationCheck.reason };
         }
 
         const candles = await fetchCoinCandles(coin, signal);
@@ -2144,7 +2304,8 @@ Respond ONLY with valid JSON:
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
-                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
+                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null,
+                dualWickSignal: filterResult.dualWickSignal || null
             }
         };
     }
@@ -2153,6 +2314,12 @@ Respond ONLY with valid JSON:
     // Per-candidate analysis - FOREX (mirrors crypto path)
     // ------------------------------------------------------------------
     async function analyzeForexCandidate(pair, quote, direction, config, sessionInfo, apiKey, twelveDataKey, signal) {
+        // Check correlation safety before doing expensive API calls
+        const correlationCheck = checkCorrelationSafety(pair, 'forex', direction);
+        if (!correlationCheck.safe) {
+            return { success: false, reason: correlationCheck.reason };
+        }
+
         const candles = await fetchForexCandles(pair, twelveDataKey, signal);
         if (!candles.ok) {
             return { success: false, reason: `Candle fetch failed: ${candles.reason}${candles.detail ? ' - ' + candles.detail : ''}` };
@@ -2216,7 +2383,8 @@ Respond ONLY with valid JSON:
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
-                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
+                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null,
+                dualWickSignal: filterResult.dualWickSignal || null
             }
         };
     }
