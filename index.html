@@ -2331,15 +2331,25 @@ Respond ONLY with valid JSON:
     // the original signal (MA trend, HH/HL structure, OTE zone, liquidity
     // sweep, FVG, volume displacement, confluence score threshold). If the
     // freshest closed candle no longer clears the bar, this says so plainly.
+    // BUG FIX: this used to look at candlesLTF[last], which on a live klines
+    // feed is ALWAYS the currently-forming candle (Binance/Twelve Data both
+    // return the in-progress bar as the final item). That made "wait until
+    // it closes" an unresolvable condition - every re-fetch just grabbed a
+    // NEW forming candle with a fresh countdown, so the wait timer looked
+    // like it kept resetting/growing instead of ever reaching zero.
+    // Fix: treat the second-to-last candle (guaranteed fully closed) as the
+    // reference for structure, and treat the still-forming last candle only
+    // as a live price snapshot - never something to wait on.
     function getCandleCloseInfo(candlesLTF) {
-        if (!candlesLTF || candlesLTF.length === 0) return null;
-        const last = candlesLTF[candlesLTF.length - 1];
-        const msRemaining = last.closeTime - Date.now();
+        if (!candlesLTF || candlesLTF.length < 2) return null;
+        const lastClosed = candlesLTF[candlesLTF.length - 2];
+        const forming = candlesLTF[candlesLTF.length - 1];
+        const msToNextClose = forming.closeTime - Date.now();
         return {
-            closeTime: last.closeTime,
-            closed: msRemaining <= 0,
-            secondsRemaining: Math.max(0, Math.round(msRemaining / 1000)),
-            lastClose: last.close
+            lastClosedCloseTime: lastClosed.closeTime,
+            lastClosedClose: lastClosed.close,
+            formingSecondsRemaining: Math.max(0, Math.round(msToNextClose / 1000)),
+            livePrice: forming.close
         };
     }
 
@@ -2356,23 +2366,17 @@ Respond ONLY with valid JSON:
                     <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate structure</button>`;
         }
 
-        // Candle still forming - a revalidation run now would just be judging
-        // an incomplete candle, so don't pretend to have a verdict yet.
-        if (!info.closed) {
-            return `
-                <div style="border-left:3px solid #f5a623; padding-left:8px;">
-                    <div style="font-weight:bold; color:#f5a623;">&#8987; CANDLE STILL FORMING - wait ~${info.secondsRemaining}s before entering at market</div>
-                    <div class="muted">Entering now risks acting on a wick that hasn't been accepted yet. Revalidation will run once this candle closes.</div>
-                    <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Check again</button>
-                </div>
-            `;
-        }
+        // The forming candle's countdown is informational only now - it never
+        // blocks revalidation. Structure checks always use the last CLOSED
+        // candle, which is available immediately on every fetch.
+        const formingNote = `<div class="muted">Next candle closes in ~${info.formingSecondsRemaining}s. Live price: ${info.livePrice}.</div>`;
 
         if (!reval) {
             return `
                 <div style="border-left:3px solid #28a745; padding-left:8px;">
-                    <div style="font-weight:bold; color:#28a745;">&#9989; CANDLE CLOSED - not yet revalidated</div>
-                    <div class="muted">Click below to re-run the full structure/OTE/FVG/sweep check on the closed candle before entering.</div>
+                    <div style="font-weight:bold; color:#28a745;">&#9989; Ready to revalidate</div>
+                    <div class="muted">Click below to re-run the full structure/OTE/FVG/sweep check against the last closed candle before entering.</div>
+                    ${formingNote}
                     <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate structure</button>
                 </div>
             `;
@@ -2385,6 +2389,7 @@ Respond ONLY with valid JSON:
                     <div style="font-weight:bold; color:#dc3545;">&#10060; STRUCTURE NO LONGER VALID - do not enter at market</div>
                     <div class="muted">${reval.reason}</div>
                     <div class="muted">Revalidated at ${checkedTime} (price then: ${reval.currentPrice})</div>
+                    ${formingNote}
                     <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate again</button>
                 </div>
             `;
@@ -2397,6 +2402,7 @@ Respond ONLY with valid JSON:
                 <div style="font-weight:bold; color:#28a745;">&#9989; STRUCTURE RECONFIRMED - fresh confluence ${reval.confluenceScore.toFixed(0)}%${breakdown}</div>
                 <div class="muted">Sweep: ${reval.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${reval.fvgConfluence ? 'yes' : 'no'}</div>
                 <div class="muted">Revalidated at ${checkedTime} (price then: ${reval.currentPrice})</div>
+                ${formingNote}
                 <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate again</button>
             </div>
         `;
@@ -2428,9 +2434,7 @@ Respond ONLY with valid JSON:
             }
 
             trade.candleCloseInfo = getCandleCloseInfo(candles.candlesLTF);
-
-            // Still forming - don't run the filter against an incomplete candle.
-            if (!trade.candleCloseInfo || !trade.candleCloseInfo.closed) {
+            if (!trade.candleCloseInfo) {
                 trade.revalidation = null;
                 if (el) el.innerHTML = candleConfirmInnerHTML(trade);
                 return;
@@ -2438,10 +2442,17 @@ Respond ONLY with valid JSON:
 
             const config = getConfig();
             const dir = trade.direction === 'Long' ? 'bullish' : 'bearish';
-            const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
+            // Structure/OTE/sweep/FVG detection runs on CLOSED candles only
+            // (drop the still-forming last bar so a moving wick can't distort
+            // the verdict). Live price is used only as the current market
+            // snapshot for the OTE-zone/entry check, matching what a market
+            // order would actually fill near.
+            const closedLTF = candles.candlesLTF.slice(0, -1);
+            const closedHTF = candles.closesHTF.slice(0, -1);
+            const currentPrice = trade.candleCloseInfo.livePrice;
             const skipVolumeCheck = marketType === 'forex';
             const filterResult = passesLocalFilter(
-                candles.closesHTF, candles.candlesLTF, currentPrice, dir,
+                closedHTF, closedLTF, currentPrice, dir,
                 config.confluenceWeights, config.minConfluenceScore, skipVolumeCheck, config.volumeDisplacementRatio
             );
 
