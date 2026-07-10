@@ -107,6 +107,21 @@
             <label for="slBufferRatio">SL buffer (% of swing leg, beyond structure)</label>
             <input type="number" id="slBufferRatio" value="10" min="1" max="100" step="1">
         </div>
+        <div>
+            <label for="exitMode">Backtest exit simulation (Backtest &amp; Sweep only)</label>
+            <select id="exitMode" onchange="onExitModeChange()">
+                <option value="sl">Structural SL (exits at the tight SL level - original behaviour)</option>
+                <option value="liquidation">Liquidation (rides to TP or liquidation - matches manual leveraged trading, no stop)</option>
+            </select>
+        </div>
+        <div id="leverageBlock" style="display:none;">
+            <label for="leverage">Leverage (isolated, x)</label>
+            <input type="number" id="leverage" value="10" min="1" max="125" step="1">
+        </div>
+        <div id="maintMarginBlock" style="display:none;">
+            <label for="maintMarginPct">Maintenance margin rate (%, exchange-specific)</label>
+            <input type="number" id="maintMarginPct" value="0.5" min="0" max="10" step="0.1">
+        </div>
         <div id="cryptoCandidateNote">
             <label for="candidateCount">Candidates per side (max)</label>
             <input type="number" id="candidateCount" value="10" min="1" max="25">
@@ -150,6 +165,12 @@
                 <option value="Asia/Tokyo">Asia/Tokyo</option>
             </select>
         </div>
+    </div>
+    <div class="row muted" id="exitModeNote" style="margin-top:8px; display:none;">
+        Liquidation mode: TP is still placed using the structural SL/RR math above (that's what decides where you take profit),
+        but the trade is only counted as a loss if price reaches your real liquidation price - not the tight structural SL.
+        The R-multiple shown is rebased against liquidation distance (your real risk unit), so a win at TP will show as a
+        much smaller R than the "targetRR" setting - that's expected, since TP is close relative to how far liquidation is.
     </div>
 </details>
 
@@ -250,7 +271,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -299,6 +320,9 @@
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
             minRRFloor: Math.max(1, parseFloat(document.getElementById('minRRFloor').value) || 2.5),
             slBufferRatio: Math.min(1, Math.max(0.01, (parseFloat(document.getElementById('slBufferRatio').value) || 10) / 100)),
+            exitMode: document.getElementById('exitMode').value,
+            leverage: Math.max(1, Math.min(125, parseFloat(document.getElementById('leverage').value) || 10)),
+            maintMarginPct: Math.max(0, Math.min(10, parseFloat(document.getElementById('maintMarginPct').value) || 0.5)) / 100,
             displayTimezone: document.getElementById('displayTimezone').value,
             forexPairs: document.getElementById('forexPairs').value.split(',').map(s => s.trim()).filter(Boolean)
         };
@@ -741,6 +765,20 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }
     }
 
+    // Approximate isolated-margin liquidation price. This is a simplified
+    // model (ignores funding, unrealized PnL from other positions, etc.) but
+    // is close enough to give an honest order-of-magnitude sense of how far
+    // liquidation sits versus a tight structural SL.
+    // Long:  liq = entry * (1 - 1/leverage + maintMarginRate)
+    // Short: liq = entry * (1 + 1/leverage - maintMarginRate)
+    function computeLiquidationPrice(direction, entry, leverage, maintMarginRate) {
+        if (!leverage || leverage <= 0) return null;
+        const invLev = 1 / leverage;
+        return direction === 'bullish'
+            ? entry * (1 - invLev + maintMarginRate)
+            : entry * (1 + invLev - maintMarginRate);
+    }
+
     function computePositionSize(entry, sl, accountBalance, riskPercent) {
         const riskAmount = accountBalance * (riskPercent / 100);
         const riskPerUnit = Math.abs(entry - sl);
@@ -1169,19 +1207,30 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     const TRADING_FRICTION_PCT = 0.0015;
 
-    function simulateTradeOutcome(ltfKlines, entryIndex, direction, levels, maxHoldBars) {
+    // exitMode 'sl' (default): loss triggers at levels.sl, R is normalized to
+    // the structural SL distance (original behaviour).
+    // exitMode 'liquidation': loss only triggers at levels.liqPrice. TP stays
+    // wherever the structural SL/RR math placed it, but R is rebased against
+    // the liquidation distance - the actual risk unit for someone holding to
+    // liquidation instead of the tight SL. This means a win at the original
+    // TP will show as a much smaller R than "targetRR" - that's correct, not
+    // a bug, because TP sits much closer than liquidation does.
+    function simulateTradeOutcome(ltfKlines, entryIndex, direction, levels, maxHoldBars, exitMode = 'sl') {
         const endIndex = Math.min(entryIndex + maxHoldBars, ltfKlines.length - 1);
-        const riskPerUnit = Math.abs(levels.entry - levels.sl);
+        const lossBoundary = (exitMode === 'liquidation' && levels.liqPrice != null) ? levels.liqPrice : levels.sl;
+        const riskPerUnit = Math.abs(levels.entry - lossBoundary);
         const frictionR = riskPerUnit > 0 ? (levels.entry * TRADING_FRICTION_PCT) / riskPerUnit : 0;
+        const rewardPerUnit = Math.abs(levels.tp - levels.entry);
+        const rr = riskPerUnit > 0 ? rewardPerUnit / riskPerUnit : levels.rr;
 
         for (let j = entryIndex + 1; j <= endIndex; j++) {
             const bar = ltfKlines[j];
             if (direction === 'bullish') {
-                if (bar.low <= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
-                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, frictionR, exitIndex: j };
+                if (bar.low <= lossBoundary) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
+                if (bar.high >= levels.tp) return { outcome: 'win', rrAchieved: rr - frictionR, frictionR, exitIndex: j };
             } else {
-                if (bar.high >= levels.sl) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
-                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: levels.rr - frictionR, frictionR, exitIndex: j };
+                if (bar.high >= lossBoundary) return { outcome: 'loss', rrAchieved: -1 - frictionR, frictionR, exitIndex: j };
+                if (bar.low <= levels.tp) return { outcome: 'win', rrAchieved: rr - frictionR, frictionR, exitIndex: j };
             }
         }
         const lastClose = ltfKlines[endIndex].close;
@@ -1191,7 +1240,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO, exitMode = 'sl', leverage = 10, maintMarginRate = 0.005) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1212,11 +1261,14 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     // doesn't affect historical simulations - they always use targetRR.
                     const levels = computeTradeLevels(direction, currentPrice, filterResult.swing, targetRR, slBufferRatio);
                     if (levels) {
-                        const result = simulateTradeOutcome(ltfKlines, i, direction, levels, maxHoldBars);
+                        if (exitMode === 'liquidation') {
+                            levels.liqPrice = computeLiquidationPrice(direction, levels.entry, leverage, maintMarginRate);
+                        }
+                        const result = simulateTradeOutcome(ltfKlines, i, direction, levels, maxHoldBars, exitMode);
                         trades.push({
                             entryIndex: i,
                             entryTime: bar.closeTime,
-                            entry: levels.entry, sl: levels.sl, tp: levels.tp,
+                            entry: levels.entry, sl: levels.sl, tp: levels.tp, liqPrice: levels.liqPrice ?? null,
                             outcome: result.outcome, rrAchieved: result.rrAchieved, frictionR: result.frictionR
                         });
                         i = result.exitIndex + 1;
@@ -1317,10 +1369,15 @@ After searching, respond with ONLY this JSON object and no other text before or 
             btLogFn(`Got ${klines1h.length} 1h candles and ${klines5m.length} 5m candles.`);
             btLogFn(`Replaying local filter logic | confluence score threshold: ${config.minConfluenceScore}%${config.killzoneOnly ? ' | KILL ZONE ONLY' : ''}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
+            const isLiqMode = config.exitMode === 'liquidation';
+            const allSimTrades = [...longTrades, ...shortTrades];
+            const avgLiqDistPct = isLiqMode && allSimTrades.length > 0
+                ? allSimTrades.reduce((sum, t) => sum + Math.abs(t.entry - t.liqPrice) / t.entry * 100, 0) / allSimTrades.length
+                : null;
 
             function fmtStats(label, s) {
                 if (s.count === 0) return `${label}: 0 signals in this window.`;
@@ -1332,6 +1389,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
             btLogFn(fmtStats('LONGS', longStats), 'success');
             btLogFn(fmtStats('SHORTS', shortStats), 'success');
             btLogFn('\nNote: backtest uses Fixed RR (targetRR setting). Fibonacci Extension rejection logic only applies to live runs.', 'muted');
+            if (isLiqMode) {
+                btLogFn(`\nExit mode: LIQUIDATION (${config.leverage}x isolated, ${(config.maintMarginPct * 100).toFixed(2)}% maint. margin). Avg liquidation distance: ${avgLiqDistPct !== null ? avgLiqDistPct.toFixed(2) + '%' : 'n/a'} from entry - trades were only counted as losses at that distance, not the structural SL. R-multiples above are rebased to that real risk unit, so they'll read much smaller than the targetRR setting on wins.`, 'muted');
+            } else {
+                btLogFn(`\nExit mode: STRUCTURAL SL - losses trigger at the tight SL level shown in the filter, not liquidation.`, 'muted');
+            }
 
             const periodStartMs = klines5m[0].closeTime;
             const periodEndMs = klines5m[klines5m.length - 1].closeTime;
@@ -1339,10 +1401,11 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const windows = regimeSplit(combinedTrades, periodStartMs, periodEndMs, 3);
 
             btResults.innerHTML = `
-                <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''}, ${config.backtestHistoryDays}d history)</strong></div>
+                <div class="row"><strong>${symbolOrPair} backtest (targetRR ${config.targetRR}:1${config.killzoneOnly ? ', kill zone only' : ''}, ${config.backtestHistoryDays}d history, exit mode: ${isLiqMode ? `LIQUIDATION @ ${config.leverage}x` : 'structural SL'})</strong></div>
                 <div class="row">Longs: ${longStats.count} trades, ${longStats.winRate !== null ? longStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${longStats.totalR.toFixed(2)}R total, ${longStats.maxDrawdownR.toFixed(2)}R max DD</div>
                 <div class="row">Shorts: ${shortStats.count} trades, ${shortStats.winRate !== null ? shortStats.winRate.toFixed(1) + '%' : 'n/a'} win rate, ${shortStats.totalR.toFixed(2)}R total, ${shortStats.maxDrawdownR.toFixed(2)}R max DD</div>
                 <div class="row muted">Raw R before friction: ${(longStats.totalRawR + shortStats.totalRawR).toFixed(2)} | Cost: ${(longStats.totalFrictionR + shortStats.totalFrictionR).toFixed(2)}R</div>
+                ${isLiqMode ? `<div class="row muted">Avg liquidation distance from entry: ${avgLiqDistPct !== null ? avgLiqDistPct.toFixed(2) + '%' : 'n/a'} (this is the real risk unit these R-multiples are measured against)</div>` : ''}
                 ${renderRegimeSplitTable(windows)}
             `;
         } catch (e) {
@@ -1477,7 +1540,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             if (symbolData.length === 0) { blog('\nNo usable data.', 'error'); return; }
 
-            blog(`\nTesting ${rrValues.length} RR x ${scoreValues.length} score x ${bufferValues.length} buffer = ${rrValues.length * scoreValues.length * bufferValues.length} combinations across ${symbolData.length} symbol(s)...\n`);
+            blog(`\nTesting ${rrValues.length} RR x ${scoreValues.length} score x ${bufferValues.length} buffer = ${rrValues.length * scoreValues.length * bufferValues.length} combinations across ${symbolData.length} symbol(s)...`);
+            blog(config.exitMode === 'liquidation'
+                ? `Exit mode: LIQUIDATION (${config.leverage}x isolated) - losses only trigger at liquidation distance, not the structural SL. R-multiples are rebased to that real risk unit.\n`
+                : `Exit mode: STRUCTURAL SL - losses trigger at the tight SL level.\n`, 'muted');
 
             const sweepResults = [];
             bufferValues.forEach(bufferPct => {
@@ -1487,8 +1553,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         let allTrades = [];
                         let longCount = 0, shortCount = 0;
                         symbolData.forEach(({ klines1h, klines5m }) => {
-                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio);
-                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio);
+                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
+                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
                             longCount += longTrades.length;
                             shortCount += shortTrades.length;
                             allTrades = allTrades.concat(longTrades, shortTrades);
@@ -2652,6 +2718,14 @@ Respond ONLY with valid JSON:
         saveConfig();
     }
 
+    function onExitModeChange() {
+        const isLiq = document.getElementById('exitMode').value === 'liquidation';
+        document.getElementById('leverageBlock').style.display = isLiq ? 'block' : 'none';
+        document.getElementById('maintMarginBlock').style.display = isLiq ? 'block' : 'none';
+        document.getElementById('exitModeNote').style.display = isLiq ? 'block' : 'none';
+        saveConfig();
+    }
+
     async function runAnalysis() {
         if (isRunning) return;
         saveConfig();
@@ -2822,6 +2896,7 @@ Respond ONLY with valid JSON:
     // ------------------------------------------------------------------
     loadConfig();
     onMarketTypeChange();
+    onExitModeChange();
     renderJournal();
     renderCircuitBreakerStatus();
 
