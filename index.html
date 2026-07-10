@@ -244,6 +244,7 @@
 <div id="nextRunSuggestion" class="note" style="display:none;"></div>
 <div id="cards"></div>
 <button id="copyBtn" onclick="copyTradePlan()">Copy Trade Plan</button>
+<button id="clearCardsBtn" onclick="clearLiveTrades()" style="background:#6c757d;">Clear Saved Cards</button>
 
 <script>
     // ------------------------------------------------------------------
@@ -1556,6 +1557,49 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     // ------------------------------------------------------------------
+    // Live trade card persistence
+    // ------------------------------------------------------------------
+    // lastValidTrades only lived in memory before, so closing or refreshing
+    // the page wiped every card - including the Refresh Spread / Revalidate
+    // Structure buttons on setups you hadn't acted on yet. This mirrors the
+    // journal's localStorage pattern to survive a page close/reopen.
+    const LIVE_TRADES_KEY = 'ictSniper_liveTrades';
+
+    function saveLiveTrades() {
+        try {
+            localStorage.setItem(LIVE_TRADES_KEY, JSON.stringify({
+                longs: lastValidTrades.longs,
+                shorts: lastValidTrades.shorts,
+                savedAt: Date.now()
+            }));
+        } catch (e) {
+            console.warn('Could not persist live trade cards:', e);
+        }
+    }
+
+    function loadLiveTrades() {
+        try {
+            const raw = localStorage.getItem(LIVE_TRADES_KEY);
+            if (!raw) return null;
+            const data = JSON.parse(raw);
+            lastValidTrades = { longs: data.longs || [], shorts: data.shorts || [] };
+            const count = lastValidTrades.longs.length + lastValidTrades.shorts.length;
+            return { count, savedAt: data.savedAt };
+        } catch (e) {
+            console.warn('Could not restore live trade cards:', e);
+            return null;
+        }
+    }
+
+    function clearLiveTrades() {
+        localStorage.removeItem(LIVE_TRADES_KEY);
+        lastValidTrades = { longs: [], shorts: [] };
+        document.getElementById('cards').innerHTML = '';
+        document.getElementById('copyBtn').style.display = 'none';
+        log('Cleared saved trade cards.', 'muted');
+    }
+
+    // ------------------------------------------------------------------
     // Trade Journal
     // ------------------------------------------------------------------
     const JOURNAL_KEY = 'ictSniper_journal';
@@ -2200,6 +2244,8 @@ Respond ONLY with valid JSON:
             if (el) el.innerHTML = spreadInnerHTML(trade);
         } catch (e) {
             if (el) el.innerHTML = `<div class="error">Spread refresh failed: ${e.message}</div>`;
+        } finally {
+            saveLiveTrades();
         }
     }
 
@@ -2354,6 +2400,8 @@ Respond ONLY with valid JSON:
         } catch (e) {
             if (el) el.innerHTML = `<div class="error">Revalidation error: ${e.message}</div>
                 <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${symbol}','${direction}','${marketType}')">&#128260; Try again</button>`;
+        } finally {
+            saveLiveTrades();
         }
     }
 
@@ -2650,6 +2698,7 @@ Respond ONLY with valid JSON:
             }
 
             rankAndRerenderCards();
+            saveLiveTrades();
             const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
             if (all.length > 0) {
                 document.getElementById('copyBtn').style.display = 'block';
@@ -2775,6 +2824,17 @@ Respond ONLY with valid JSON:
     onMarketTypeChange();
     renderJournal();
     renderCircuitBreakerStatus();
+
+    (function restoreLiveTrades() {
+        const restored = loadLiveTrades();
+        if (restored && restored.count > 0) {
+            rankAndRerenderCards();
+            document.getElementById('copyBtn').style.display = 'block';
+            const savedTime = new Date(restored.savedAt).toLocaleString();
+            log(`Restored ${restored.count} trade card(s) from before the page was closed (saved ${savedTime}). Spread and candle data on them may be outdated - use Refresh Spread / Revalidate Structure before acting on any of them.`, 'muted');
+        }
+    })();
+
 </script>
 </body>
 </html>
