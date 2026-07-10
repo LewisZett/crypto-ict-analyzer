@@ -945,6 +945,24 @@ After searching, respond with ONLY this JSON object and no other text before or 
         }));
     }
 
+    // ------------------------------------------------------------------
+    // Live bid/ask (Binance book ticker) - used by the spread safety gate
+    // ------------------------------------------------------------------
+    async function fetchBookTicker(symbol, signal) {
+        try {
+            const res = await fetchWithRetry(`${BINANCE_BASE}/ticker/bookTicker?symbol=${symbol}`, { signal });
+            if (!res.ok) return null;
+            const data = await res.json();
+            const bidPrice = parseFloat(data.bidPrice);
+            const askPrice = parseFloat(data.askPrice);
+            if (!bidPrice || !askPrice) return null;
+            return { bidPrice, askPrice };
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            return null;
+        }
+    }
+
     async function fetchKlinesDetailed(symbol, interval, limit, signal, startTime) {
         let url = `${BINANCE_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
         if (startTime) url += `&startTime=${startTime}`;
@@ -2032,6 +2050,7 @@ Respond ONLY with valid JSON:
             ${renderOrderTypeSection(trade)}
             <div class="row">Entry: ${trade.entry} | SL: ${trade.sl} | TP: ${trade.tp} | RR: ${(typeof trade.rr === 'number' ? trade.rr.toFixed(2) : trade.rr)}:1</div>
             ${renderTPModeSection(trade)}
+            ${renderSpreadSection(trade)}
             <div class="row">Position: ${trade.units} ${trade.symbol} (~$${trade.positionUSD} notional, risking ~$${trade.riskAmount})</div>
             <div class="row">AI context read (unvalidated): ${trade.confidence}</div>
             ${renderVolumeSection(trade)}
@@ -2068,7 +2087,11 @@ Respond ONLY with valid JSON:
         if (all.length === 0) return 'No valid trades found this run.';
         all.forEach((t, i) => {
             const orderTag = t.orderType ? `${t.orderType.toUpperCase()} @ ${t.entry}` : `Entry: ${t.entry}`;
-            lines.push(`${i + 1}. ${t.direction} ${t.symbol}${t.marketType === 'forex' ? ' [FX]' : ''} | ${orderTag} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Score: ${t.confluenceScore ? t.confluenceScore.toFixed(0) + '%' : 'n/a'} | ${t.notes}`);
+            const sc = t.spreadCheck;
+            const spreadTag = (sc && sc.available)
+                ? ` | Spread: ${sc.isSafe ? 'SAFE' : (sc.isWarning ? 'ELEVATED' : 'TOO WIDE')} (${sc.riskConsumedPercent}% of risk)`
+                : '';
+            lines.push(`${i + 1}. ${t.direction} ${t.symbol}${t.marketType === 'forex' ? ' [FX]' : ''} | ${orderTag} | SL: ${t.sl} | TP: ${t.tp} | RR: ${t.rr}:1 | Size: ${t.units} ${t.symbol} | Confidence: ${t.confidence} | Score: ${t.confluenceScore ? t.confluenceScore.toFixed(0) + '%' : 'n/a'}${spreadTag} | ${t.notes}`);
         });
         return lines.join('\n');
     }
@@ -2079,6 +2102,100 @@ Respond ONLY with valid JSON:
         }).catch(() => {
             log('Could not copy automatically.', 'error');
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Spread safety gate
+    // ------------------------------------------------------------------
+    // Wide bid/ask spreads on tight-stop trades silently eat into risk
+    // before the trade even starts (the "phantom stop-out" problem). This
+    // gate compares the live spread against the trade's own risk distance
+    // so a $ spread that's tiny in absolute terms can still be flagged as
+    // dangerous on a trade with a very tight stop, and vice versa.
+    function getSpreadThresholdForSession(sessionInfo) {
+        if (!sessionInfo) return 10;
+        if (sessionInfo.inKillZone) return 12;   // higher volume, a bit more forgiving
+        if (sessionInfo.isAsian) return 8;       // thinner liquidity, stricter
+        return 10;
+    }
+
+    function checkSpreadSafety(entryPrice, slPrice, bidPrice, askPrice, thresholdPercent) {
+        const threshold = thresholdPercent || 10;
+        const warningCeiling = threshold + 5;
+        const riskDistance = Math.abs(entryPrice - slPrice);
+        if (!riskDistance || !bidPrice || !askPrice || askPrice <= 0 || askPrice < bidPrice) {
+            return { available: false, reason: 'Bid/ask data unavailable or invalid' };
+        }
+        const spread = askPrice - bidPrice;
+        const mid = (bidPrice + askPrice) / 2;
+        const spreadPercent = (spread / mid) * 100;
+        const riskConsumedPercent = (spread / riskDistance) * 100;
+        const isSafe = riskConsumedPercent <= threshold;
+        const isWarning = !isSafe && riskConsumedPercent <= warningCeiling;
+        return {
+            available: true,
+            spreadPercent: spreadPercent.toFixed(3),
+            riskConsumedPercent: riskConsumedPercent.toFixed(1),
+            isSafe, isWarning,
+            thresholdUsed: threshold,
+            bidPrice, askPrice,
+            fetchedAt: Date.now()
+        };
+    }
+
+    function spreadElId(symbol, direction) {
+        return `spread-${String(symbol).replace(/[^a-zA-Z0-9]/g, '_')}-${direction}`;
+    }
+
+    function spreadInnerHTML(trade) {
+        const sc = trade.spreadCheck;
+        if (!sc || !sc.available) {
+            return `<div class="muted">Spread gate: ${sc && sc.reason ? sc.reason : 'not available for this feed'}</div>`;
+        }
+        const statusColor = sc.isSafe ? '#28a745' : (sc.isWarning ? '#f5a623' : '#dc3545');
+        const statusText = sc.isSafe
+            ? '✅ SPREAD SAFE TO EXECUTE'
+            : (sc.isWarning ? '⚠️ SPREAD ELEVATED - CONSIDER WAITING' : '❌ SPREAD TOO WIDE - SKIP');
+        return `
+            <div style="border-left:3px solid ${statusColor}; padding-left:8px;">
+                <div style="font-weight:bold; color:${statusColor};">${statusText}</div>
+                <div class="muted">Spread: ${sc.spreadPercent}% | Consuming ${sc.riskConsumedPercent}% of stop risk (threshold ${sc.thresholdUsed}%)</div>
+                <div class="muted">Bid: ${sc.bidPrice} | Ask: ${sc.askPrice} | as of ${new Date(sc.fetchedAt).toLocaleTimeString()}</div>
+                <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="refreshSpreadOnly('${trade.symbol}','${trade.direction}')">&#128260; Refresh Spread</button>
+            </div>
+        `;
+    }
+
+    function renderSpreadSection(trade) {
+        return `<div class="row" id="${spreadElId(trade.symbol, trade.direction)}">${spreadInnerHTML(trade)}</div>`;
+    }
+
+    async function refreshSpreadOnly(symbol, direction) {
+        const all = [...lastValidTrades.longs, ...lastValidTrades.shorts];
+        const trade = all.find(t => t.symbol === symbol && t.direction === direction);
+        if (!trade) return;
+        const el = document.getElementById(spreadElId(symbol, direction));
+        if (el) el.innerHTML = '<div class="muted">Refreshing spread...</div>';
+        try {
+            if (trade.marketType !== 'crypto') {
+                trade.spreadCheck = { available: false, reason: 'Bid/ask spread not available via the Twelve Data free-tier quote endpoint' };
+                if (el) el.innerHTML = spreadInnerHTML(trade);
+                return;
+            }
+            const bidAsk = await fetchBookTicker(symbol.toUpperCase() + 'USDT');
+            if (!bidAsk) {
+                trade.spreadCheck = { available: false, reason: 'Binance book ticker fetch failed' };
+                if (el) el.innerHTML = spreadInnerHTML(trade);
+                return;
+            }
+            const config = getConfig();
+            const sessionInfo = getSessionInfo(config.displayTimezone);
+            const threshold = getSpreadThresholdForSession(sessionInfo);
+            trade.spreadCheck = checkSpreadSafety(parseFloat(trade.entry), parseFloat(trade.sl), bidAsk.bidPrice, bidAsk.askPrice, threshold);
+            if (el) el.innerHTML = spreadInnerHTML(trade);
+        } catch (e) {
+            if (el) el.innerHTML = `<div class="error">Spread refresh failed: ${e.message}</div>`;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2192,11 +2309,26 @@ Respond ONLY with valid JSON:
 
         const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
 
+        let spreadCheck = { available: false, reason: 'Bid/ask fetch skipped' };
+        try {
+            const bookTicker = await fetchBookTicker(binanceSymbolFor(coin), signal);
+            if (bookTicker) {
+                const spreadThreshold = getSpreadThresholdForSession(sessionInfo);
+                spreadCheck = checkSpreadSafety(levels.entry, levels.sl, bookTicker.bidPrice, bookTicker.askPrice, spreadThreshold);
+            } else {
+                spreadCheck = { available: false, reason: 'Binance book ticker fetch failed' };
+            }
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            spreadCheck = { available: false, reason: `Book ticker error: ${e.message}` };
+        }
+
         return {
             success: true,
             trade: {
                 marketType: 'crypto',
                 name: coin.name, symbol,
+                spreadCheck,
                 entry: levels.entry.toFixed(6), sl: levels.sl.toFixed(6), tp: levels.tp.toFixed(6),
                 rr: levels.rr,
                 units: sizing.units.toFixed(4), positionUSD: sizing.positionUSD.toFixed(2), riskAmount: sizing.riskAmount.toFixed(2),
@@ -2274,6 +2406,7 @@ Respond ONLY with valid JSON:
             trade: {
                 marketType: 'forex',
                 name: pair, symbol: pair,
+                spreadCheck: { available: false, reason: 'Bid/ask spread not available via the Twelve Data free-tier quote endpoint' },
                 entry: levels.entry.toFixed(6), sl: levels.sl.toFixed(6), tp: levels.tp.toFixed(6),
                 rr: levels.rr,
                 units: sizing.units.toFixed(4), positionUSD: sizing.positionUSD.toFixed(2), riskAmount: sizing.riskAmount.toFixed(2),
