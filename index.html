@@ -149,6 +149,12 @@
             </label>
         </div>
         <div>
+            <label for="limitOnlySignals" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
+                <input type="checkbox" id="limitOnlySignals" style="width:auto; margin:0;" checked>
+                Limit-order signals only (skip signals where price already reached entry - avoids market-order drift on manual execution, Live Run only)
+            </label>
+        </div>
+        <div>
             <label for="circuitBreakerEnabled" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
                 <input type="checkbox" id="circuitBreakerEnabled" style="width:auto; margin:0;" checked>
                 Enable circuit breaker (pause new entries after rolling 24h loss &ge; 3% of account)
@@ -271,7 +277,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct', 'limitOnlySignals'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -323,6 +329,7 @@
             exitMode: document.getElementById('exitMode').value,
             leverage: Math.max(1, Math.min(125, parseFloat(document.getElementById('leverage').value) || 10)),
             maintMarginPct: Math.max(0, Math.min(10, parseFloat(document.getElementById('maintMarginPct').value) || 0.5)) / 100,
+            limitOnlySignals: document.getElementById('limitOnlySignals').checked,
             displayTimezone: document.getElementById('displayTimezone').value,
             forexPairs: document.getElementById('forexPairs').value.split(',').map(s => s.trim()).filter(Boolean)
         };
@@ -2397,11 +2404,20 @@ Respond ONLY with valid JSON:
         const breakdown = reval.confluenceBreakdown
             ? ` - passed: ${reval.confluenceBreakdown.passed.join(', ') || 'none'}${reval.confluenceBreakdown.failed.length ? `; missing: ${reval.confluenceBreakdown.failed.join(', ')}` : ''}`
             : '';
+        const fresh = reval.freshLevels;
+        const freshBlock = fresh
+            ? `<div style="background:#1a2f1a; border-radius:4px; padding:8px; margin-top:6px;">
+                    <div style="font-weight:bold;">Fresh numbers - use THESE, not the original signal's levels:</div>
+                    <div>Entry: ${fresh.entry} | SL: ${fresh.sl} | TP: ${fresh.tp} | RR: ${fresh.rr.toFixed(2)}:1</div>
+                    <div>Size: ${fresh.units} units (~$${fresh.positionUSD} notional, risking ~$${fresh.riskAmount})</div>
+               </div>`
+            : `<div class="error">Could not recompute fresh levels (structure/risk distance invalid at current price) - do not enter.</div>`;
         return `
             <div style="border-left:3px solid #28a745; padding-left:8px;">
                 <div style="font-weight:bold; color:#28a745;">&#9989; STRUCTURE RECONFIRMED - fresh confluence ${reval.confluenceScore.toFixed(0)}%${breakdown}</div>
                 <div class="muted">Sweep: ${reval.sweepConfirmed ? 'confirmed' : 'not confirmed'} | FVG: ${reval.fvgConfluence ? 'yes' : 'no'}</div>
-                <div class="muted">Revalidated at ${checkedTime} (price then: ${reval.currentPrice})</div>
+                <div class="muted">Revalidated at ${checkedTime} (live price: ${reval.currentPrice})</div>
+                ${freshBlock}
                 ${formingNote}
                 <button type="button" style="width:auto; padding:4px 10px; font-size:12px; margin-top:4px;" onclick="revalidateStructure('${trade.symbol}','${trade.direction}','${trade.marketType}')">&#128260; Revalidate again</button>
             </div>
@@ -2457,15 +2473,34 @@ Respond ONLY with valid JSON:
             );
 
             trade.revalidation = filterResult.pass
-                ? {
-                    pass: true,
-                    confluenceScore: filterResult.confluenceScore,
-                    confluenceBreakdown: filterResult.confluenceBreakdown,
-                    sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
-                    fvgConfluence: !!filterResult.fvgMatch,
-                    currentPrice: currentPrice.toFixed(6),
-                    checkedAt: Date.now()
-                }
+                ? (() => {
+                    // Recompute levels FRESH off live price + current structure,
+                    // instead of just confirming the original stale ones still
+                    // "pass". This is the actual fix for the drift problem: SL/TP/
+                    // position size are only ever correct at the instant they're
+                    // calculated, so a market order needs fresh numbers, not a
+                    // pass/fail stamp on old ones.
+                    const freshLevels = computeAdaptiveTradeLevels(dir, currentPrice, filterResult.swing, config);
+                    const freshSizing = freshLevels ? computePositionSize(freshLevels.entry, freshLevels.sl, config.accountBalance, config.riskPercent) : null;
+                    return {
+                        pass: true,
+                        confluenceScore: filterResult.confluenceScore,
+                        confluenceBreakdown: filterResult.confluenceBreakdown,
+                        sweepConfirmed: filterResult.sweep ? filterResult.sweep.swept : false,
+                        fvgConfluence: !!filterResult.fvgMatch,
+                        currentPrice: currentPrice.toFixed(6),
+                        checkedAt: Date.now(),
+                        freshLevels: freshLevels ? {
+                            entry: freshLevels.entry.toFixed(6),
+                            sl: freshLevels.sl.toFixed(6),
+                            tp: freshLevels.tp.toFixed(6),
+                            rr: freshLevels.rr,
+                            units: freshSizing.units.toFixed(4),
+                            positionUSD: freshSizing.positionUSD.toFixed(2),
+                            riskAmount: freshSizing.riskAmount.toFixed(2)
+                        } : null
+                    };
+                })()
                 : {
                     pass: false,
                     reason: filterResult.reason,
@@ -2835,9 +2870,13 @@ Respond ONLY with valid JSON:
             log(`Analyzing ${coin.symbol.toUpperCase()} (${direction})...`);
             const result = await analyzeCandidate(coin, direction, config, sessionInfo, apiKey, signal);
             if (result.success) {
-                log(`  ✓ ${coin.symbol.toUpperCase()} ${direction}: VALID trade signal`, 'success');
-                if (direction === 'bullish') lastValidTrades.longs.push(result.trade);
-                else lastValidTrades.shorts.push(result.trade);
+                if (config.limitOnlySignals && result.trade.orderType === 'market') {
+                    log(`  ~ ${coin.symbol.toUpperCase()} ${direction}: valid setup but price already at/past entry (market order) - skipped, limit-only mode is on`, 'muted');
+                } else {
+                    log(`  ✓ ${coin.symbol.toUpperCase()} ${direction}: VALID trade signal`, 'success');
+                    if (direction === 'bullish') lastValidTrades.longs.push(result.trade);
+                    else lastValidTrades.shorts.push(result.trade);
+                }
             } else {
                 log(`  ✗ ${coin.symbol.toUpperCase()} ${direction}: ${result.reason}`, 'muted');
             }
@@ -2882,9 +2921,13 @@ Respond ONLY with valid JSON:
 
             const result = await analyzeForexCandidate(pair, quote, direction, config, sessionInfo, apiKey, tdKey, signal);
             if (result.success) {
-                log(`  ✓ ${pair} ${direction}: VALID trade signal`, 'success');
-                if (direction === 'bullish') lastValidTrades.longs.push(result.trade);
-                else lastValidTrades.shorts.push(result.trade);
+                if (config.limitOnlySignals && result.trade.orderType === 'market') {
+                    log(`  ~ ${pair} ${direction}: valid setup but price already at/past entry (market order) - skipped, limit-only mode is on`, 'muted');
+                } else {
+                    log(`  ✓ ${pair} ${direction}: VALID trade signal`, 'success');
+                    if (direction === 'bullish') lastValidTrades.longs.push(result.trade);
+                    else lastValidTrades.shorts.push(result.trade);
+                }
             } else {
                 log(`  ✗ ${pair} ${direction}: ${result.reason}`, 'muted');
             }
