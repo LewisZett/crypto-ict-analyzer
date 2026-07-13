@@ -218,6 +218,26 @@
             <label for="weightVolume">Weight: Volume displacement</label>
             <input type="number" id="weightVolume" value="15" min="0" step="1">
         </div>
+        <div>
+            <label for="weightOb">Weight: Order Block retest (wick-only = full pts, body-deep = ~⅓ pts, body through = 0)</label>
+            <input type="number" id="weightOb" value="10" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightHtfStructure">Weight: 4H structure alignment (HH/HL or LH/LL on 4H agrees with trade direction)</label>
+            <input type="number" id="weightHtfStructure" value="10" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightCHoCHRecency">Weight: CHoCH recency (graduated; fresh &gt; stale)</label>
+            <input type="number" id="weightCHoCHRecency" value="12" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightInducementSweep">Weight: Inducement sweep (pivot break + recovery precondition)</label>
+            <input type="number" id="weightInducementSweep" value="8" min="0" step="1">
+        </div>
+        <div>
+            <label for="weightHTFFVG">Weight: HTF FVG confluence (4H FVG + current price)</label>
+            <input type="number" id="weightHTFFVG" value="10" min="0" step="1">
+        </div>
     </div>
 </details>
 
@@ -277,7 +297,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct', 'limitOnlySignals'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'weightOb', 'weightHtfStructure', 'weightCHoCHRecency', 'weightInducementSweep', 'weightHTFFVG', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct', 'limitOnlySignals'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -320,7 +340,12 @@
                 ote: Math.max(0, parseFloat(document.getElementById('weightOte').value) || 0),
                 sweep: Math.max(0, parseFloat(document.getElementById('weightSweep').value) || 0),
                 fvg: Math.max(0, parseFloat(document.getElementById('weightFvg').value) || 0),
-                volume: Math.max(0, parseFloat(document.getElementById('weightVolume').value) || 0)
+                volume: Math.max(0, parseFloat(document.getElementById('weightVolume').value) || 0),
+                ob: Math.max(0, parseFloat(document.getElementById('weightOb').value) || 0),
+                htfStructure: Math.max(0, parseFloat(document.getElementById('weightHtfStructure').value) || 0),
+                chochRecency: Math.max(0, parseFloat(document.getElementById('weightCHoCHRecency').value) || 0),
+                inducementSweep: Math.max(0, parseFloat(document.getElementById('weightInducementSweep').value) || 0),
+                htfFvg: Math.max(0, parseFloat(document.getElementById('weightHTFFVG').value) || 0)
             },
             tpMode: document.getElementById('tpMode').value,
             extensionRatio: parseFloat(document.getElementById('extensionRatio').value) || 1.618,
@@ -559,6 +584,90 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return lowerHigh && lowerLow;
     }
 
+    // CHoCH Recency Scoring: returns { ok: true/false, score: 0-weight, bars: N, chochType: 'HH/HL' or 'LH/LL' }
+    // Penalizes stale structures: fresh CHoCH scores full weight, decays over ~15 bars
+    function checkTrendStructureWithRecency(closes, direction, lookback, weight, wing = 2) {
+        const slice = closes.slice(-lookback);
+        const { highs, lows } = findFractalSwings(slice, wing);
+        if (highs.length < 2 || lows.length < 2) {
+            return { ok: false, score: 0, bars: null, chochType: null, reason: 'Insufficient fractal swings' };
+        }
+
+        const lastTwoHighs = highs.slice(-2);
+        const lastTwoLows = lows.slice(-2);
+        const higherHigh = lastTwoHighs[1].price > lastTwoHighs[0].price;
+        const higherLow = lastTwoLows[1].price > lastTwoLows[0].price;
+        const lowerHigh = lastTwoHighs[1].price < lastTwoHighs[0].price;
+        const lowerLow = lastTwoLows[1].price < lastTwoLows[0].price;
+
+        const isValid = (direction === 'bullish') ? (higherHigh && higherLow) : (lowerHigh && lowerLow);
+        if (!isValid) {
+            return { ok: false, score: 0, bars: null, chochType: null, reason: 'Structure broken' };
+        }
+
+        // Measure bars since most recent CHoCH (use the second-most-recent fractal as the CHoCH point)
+        const chochIndex = direction === 'bullish' ? lastTwoLows[0].index : lastTwoHighs[0].index;
+        const barsSinceChoCH = slice.length - 1 - chochIndex;
+
+        // Score decay: full at 0 bars, half at ~15 bars, minimal by 30+
+        const maxDecayBars = 15;
+        const decayFactor = Math.max(0.2, 1 - (barsSinceChoCH / maxDecayBars));
+        const score = weight * decayFactor;
+
+        const chochType = direction === 'bullish' ? 'HH/HL' : 'LH/LL';
+        return { ok: true, score, bars: barsSinceChoCH, chochType, reason: `${chochType} CHoCH (${barsSinceChoCH} bars ago)` };
+    }
+
+    // Inducement Sweep: detects if the previous pivot was broken (inducement) before the main sweep recovery
+    // Returns { induced: bool, inducedLevel: price, distance: bars }
+    // This is a precondition, NOT the main sweep itself — it qualifies the sweep
+    function detectInducementSweep(candlesLTF, direction, wing = 2) {
+        if (!candlesLTF || candlesLTF.length < wing * 2 + 10) {
+            return { induced: false, inducedLevel: null, distance: null };
+        }
+
+        const { highs, lows } = findFractalHighLowCandles(candlesLTF, wing);
+        const pivots = direction === 'bullish' ? lows : highs;
+
+        if (pivots.length < 2) {
+            return { induced: false, inducedLevel: null, distance: null };
+        }
+
+        // Second-most-recent pivot (the one before the current low/high)
+        const inductionTarget = pivots[pivots.length - 2];
+        const mostRecentPivot = pivots[pivots.length - 1];
+
+        // Check: was induction target broken between the two pivots?
+        const candles = candlesLTF.slice(inductionTarget.index, mostRecentPivot.index + 1);
+        let wasInduced = false;
+
+        for (const bar of candles) {
+            if (direction === 'bullish' && bar.low < inductionTarget.price) {
+                wasInduced = true;
+                break;
+            }
+            if (direction === 'bearish' && bar.high > inductionTarget.price) {
+                wasInduced = true;
+                break;
+            }
+        }
+
+        const distanceBars = mostRecentPivot.index - inductionTarget.index;
+        return {
+            induced: wasInduced,
+            inducedLevel: wasInduced ? inductionTarget.price : null,
+            distance: wasInduced ? distanceBars : null
+        };
+    }
+
+    // HTF FVG Detection: same as LTF but operates on 4H (or HTF) candles
+    // Returns the FVG array for 4H data
+    function detectHTFFVG(candles4H, direction) {
+        if (!candles4H || candles4H.length < 3) return [];
+        // Use last 60 bars of 4H data (equivalent to ~10 days at 4H)
+        return findFVGs(candles4H.slice(-60), direction);
+    }
+
     function getOTEZone(high, low, direction) {
         const range = high - low;
         if (direction === 'bullish') {
@@ -666,6 +775,88 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return fvgs.find(g => price >= g.bottom && price <= g.top) || null;
     }
 
+    // ------------------------------------------------------------------
+    // Order Block (OB) detection
+    // ------------------------------------------------------------------
+    // Traces back from the most recent FVG displacement candle to find the
+    // last candle that closed in the OPPOSITE direction (the OB origin).
+    // Then grades how the most recent candle interacted with that OB zone:
+    //   - Wick-only entry (body stays outside zone)  → full score
+    //   - Body closes past zone midpoint             → partial score
+    //   - Body closes past the OB invalidation level → zone failed (0)
+    // If no FVG is present the check is skipped (returns obScore: 0, reason).
+    function detectOrderBlock(candlesLTF, fvgs, direction, fullWeight) {
+        if (!fvgs || fvgs.length === 0) {
+            return { obScore: 0, obZone: null, obInteraction: 'no_fvg', obLabel: 'No FVG present — OB not evaluated' };
+        }
+
+        // Most recent FVG's displacement candle is at fvg.index (candle N in the
+        // 3-candle sequence; N-2 is C1, N is C3).  We scan backward from N-1
+        // to find the last candle that closed opposite to the displacement direction.
+        const latestFVG = fvgs[fvgs.length - 1];
+        const displacementIdx = latestFVG.index; // index into the slice passed to findFVGs
+
+        // findFVGs operates on candlesLTF.slice(-60), so map back to full array
+        const ltfLen = candlesLTF.length;
+        const sliceStart = Math.max(0, ltfLen - 60);
+        const absDispIdx = sliceStart + displacementIdx;
+
+        // Scan backward from the candle before displacement for the OB origin
+        let obCandle = null;
+        for (let i = absDispIdx - 1; i >= Math.max(0, absDispIdx - 20); i--) {
+            const c = candlesLTF[i];
+            if (direction === 'bullish' && c.close < c.open) { obCandle = c; break; } // last bearish candle before bullish FVG
+            if (direction === 'bearish' && c.close > c.open) { obCandle = c; break; } // last bullish candle before bearish FVG
+        }
+
+        if (!obCandle) {
+            return { obScore: 0, obZone: null, obInteraction: 'no_ob_found', obLabel: 'No opposing candle found near FVG origin' };
+        }
+
+        const obZone = { high: obCandle.high, low: obCandle.low };
+        const obMid = (obZone.high + obZone.low) / 2;
+
+        // Evaluate the most recently closed candle's interaction with the OB zone
+        const recent = candlesLTF[ltfLen - 1];
+
+        // For a bullish OB: price should be retesting from above, entering the zone
+        // For a bearish OB: price should be retesting from below, entering the zone
+        const enteredZone = direction === 'bullish'
+            ? (recent.low <= obZone.high && recent.high >= obZone.low)
+            : (recent.high >= obZone.low && recent.low <= obZone.high);
+
+        if (!enteredZone) {
+            // Price hasn't reached the OB yet — not a failure, just not yet scored
+            return { obScore: 0, obZone, obInteraction: 'not_reached', obLabel: `OB zone (${obZone.low.toFixed(6)}-${obZone.high.toFixed(6)}) — price not yet retesting` };
+        }
+
+        // Determine where the candle body closed relative to the OB zone
+        const bodyHigh = Math.max(recent.open, recent.close);
+        const bodyLow  = Math.min(recent.open, recent.close);
+
+        // Invalidation: body closes completely through the OB (past opposite boundary)
+        const invalidated = direction === 'bullish'
+            ? bodyLow < obZone.low   // body closed below OB low on a bullish retest
+            : bodyHigh > obZone.high; // body closed above OB high on a bearish retest
+
+        if (invalidated) {
+            return { obScore: 0, obZone, obInteraction: 'invalidated', obLabel: `OB zone body-closed through — zone failed (0 pts)` };
+        }
+
+        // Body deep into zone: body midpoint is past the OB 50% threshold
+        const bodyDeep = direction === 'bullish'
+            ? bodyLow < obMid   // body penetrated below midpoint
+            : bodyHigh > obMid; // body penetrated above midpoint
+
+        if (bodyDeep) {
+            const partialScore = fullWeight * 0.33; // ~1/3 credit
+            return { obScore: partialScore, obZone, obInteraction: 'body_deep', obLabel: `OB body penetrated past midpoint — weak retest (${partialScore.toFixed(1)}/${fullWeight} pts)` };
+        }
+
+        // Wick-only: wick entered zone but body closed outside → maximum confluence
+        return { obScore: fullWeight, obZone, obInteraction: 'wick_only', obLabel: `OB wick-only entry — institutional defence confirmed (${fullWeight}/${fullWeight} pts)` };
+    }
+
     function detectDualWicks(candlesLTF, swing, direction) {
         // Dual-wick flag: both upper and lower wicks touch swing extremes on same candle
         if (!candlesLTF || candlesLTF.length === 0) return { detected: false, strength: 0 };
@@ -698,7 +889,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         };
     }
 
-    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT) {
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT, closes4H = null, candles4H = null) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
 
@@ -709,33 +900,91 @@ After searching, respond with ONLY this JSON object and no other text before or 
         if (swing.high === swing.low) return { pass: false, reason: 'No meaningful LTF price range to compute Fibonacci levels' };
 
         const maOk = direction === 'bullish' ? currentPrice > sma : currentPrice < sma;
-        const structureOk = checkTrendStructure(closesHTF, direction, Math.min(50, closesHTF.length));
 
-        if (!maOk && !structureOk) {
-            return { pass: false, reason: 'Both MA trend and HH/HL structure disagree with this direction - hard rejected regardless of confluence score' };
+        // CHoCH Recency: graduated scoring (not binary)
+        const chochRecencyWeight = weights.chochRecency || 0;
+        const chochResult = chochRecencyWeight > 0
+            ? checkTrendStructureWithRecency(closesHTF, direction, Math.min(50, closesHTF.length), chochRecencyWeight)
+            : { ok: false, score: 0, bars: null, chochType: null };
+
+        // Hard gate: MA trend AND (CHoCH ok OR 4H structure ok) — at least one structural signal must pass
+        const htfStructureWeight = weights.htfStructure || 0;
+        const htfStructureOk = (htfStructureWeight > 0 && closes4H && closes4H.length >= 10)
+            ? checkTrendStructure(closes4H, direction, Math.min(50, closes4H.length))
+            : null;
+
+        if (!maOk && !chochResult.ok && htfStructureOk !== true) {
+            return { pass: false, reason: 'Both MA trend and CHoCH structure disagree with this direction - hard rejected regardless of confluence score' };
         }
 
         const inOTE = isInOTEZone(currentPrice, swing.high, swing.low, direction);
         const volCheck = skipVolumeCheck ? null : checkVolumeDisplacement(volumesLTF, volumeDisplacementRatio);
         const sweep = detectLiquiditySweep(candlesLTF, direction);
         const dualWicks = detectDualWicks(candlesLTF, swing, direction);
+
+        // Inducement sweep: precondition to confirm sweep quality
+        const inducementWeight = weights.inducementSweep || 0;
+        const inducement = inducementWeight > 0 ? detectInducementSweep(candlesLTF, direction) : { induced: false };
+
+        // FVG detection (LTF)
         const fvgs = findFVGs(candlesLTF.slice(-60), direction);
         const fvgMatch = findFVGContainingPrice(currentPrice, fvgs);
 
+        // HTF FVG Detection (4H)
+        const htfFvgWeight = weights.htfFvg || 0;
+        const htfFvgs = (htfFvgWeight > 0 && candles4H && candles4H.length >= 10)
+            ? detectHTFFVG(candles4H, direction)
+            : [];
+        const htfFvgMatch = htfFvgWeight > 0 && htfFvgs.length > 0 ? findFVGContainingPrice(currentPrice, htfFvgs) : null;
+
+        // Order Block detection (LTF)
+        const obWeight = weights.ob || 0;
+        const obResult = obWeight > 0 ? detectOrderBlock(candlesLTF, fvgs, direction, obWeight) : { obScore: 0, obZone: null, obInteraction: 'disabled', obLabel: 'OB weight is 0 — not evaluated' };
+
+        // Factors: binary + graduated scoring
         const factors = [
             { label: 'MA trend', ok: maOk, weight: weights.sma },
-            { label: 'Structure', ok: structureOk, weight: weights.structure },
             { label: 'OTE zone', ok: inOTE, weight: weights.ote },
             { label: 'Liquidity sweep', ok: sweep.swept, weight: weights.sweep },
-            { label: 'FVG', ok: !!fvgMatch, weight: weights.fvg }
+            { label: 'FVG (LTF)', ok: !!fvgMatch, weight: weights.fvg }
         ];
+
+        // CHoCH Recency: replaces binary Structure, contributes graduated score
+        if (chochRecencyWeight > 0) {
+            factors.push({ label: `Structure (CHoCH recency - ${chochResult.bars !== null ? chochResult.bars + ' bars' : 'n/a'})`, ok: chochResult.ok, weight: chochRecencyWeight, score: chochResult.score });
+        }
+
+        // Inducement Sweep: new binary factor
+        if (inducementWeight > 0) {
+            factors.push({ label: 'Inducement sweep', ok: inducement.induced, weight: inducementWeight });
+        }
+
+        // HTF FVG: new graduated factor
+        if (htfFvgWeight > 0) {
+            const htfFvgOk = htfFvgMatch !== null;
+            factors.push({ label: 'FVG (HTF/4H)', ok: htfFvgOk, weight: htfFvgWeight, score: htfFvgOk ? htfFvgWeight : 0 });
+        }
+
+        // Volume displacement (if checked)
         if (volCheck !== null) factors.push({ label: 'Volume displacement', ok: volCheck.ok, weight: weights.volume });
 
-        const maxScore = factors.reduce((s, f) => s + f.weight, 0);
-        const achieved = factors.filter(f => f.ok).reduce((s, f) => s + f.weight, 0);
+        // 4H structure (if enabled)
+        if (htfStructureOk !== null) factors.push({ label: '4H structure', ok: htfStructureOk, weight: htfStructureWeight });
+
+        // Calculate max score: binary factors (weight per yes/no) + graduated factors (score field)
+        const maxScore = factors.reduce((s, f) => s + (f.score !== undefined ? f.weight : f.weight), 0) + obWeight;
+        // Achieved: binary pass + graduated scores + OB partial score
+        const achieved = factors.filter(f => f.ok).reduce((s, f) => s + (f.score !== undefined ? f.score : f.weight), 0) + obResult.obScore;
         const scorePct = maxScore > 0 ? (achieved / maxScore * 100) : 0;
         const passedLabels = factors.filter(f => f.ok).map(f => f.label);
         const failedLabels = factors.filter(f => !f.ok).map(f => f.label);
+
+        // OB label handling
+        if (obWeight > 0) {
+            if (obResult.obScore >= obWeight) passedLabels.push('OB retest');
+            else if (obResult.obScore > 0) passedLabels.push(`OB retest (partial: ${obResult.obScore.toFixed(1)}/${obWeight}pts)`);
+            else failedLabels.push('OB retest');
+        }
 
         if (scorePct < minConfluenceScore) {
             return {
@@ -746,8 +995,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
         return {
             pass: true, sma, swing, volumeRatio: volCheck ? volCheck.ratio : null, sweep, fvgMatch, dualWicks,
+            obResult,
             confluenceScore: scorePct, confluenceBreakdown: { passed: passedLabels, failed: failedLabels },
-            dualWickSignal: dualWicks.signal
+            dualWickSignal: dualWicks.signal,
+            chochResult, inducement, htfFvgMatch
         };
     }
 
@@ -1054,9 +1305,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
     async function fetchCoinCandles(coin, signal) {
         const symbol = binanceSymbolFor(coin);
-        const [r1h, r5m] = await Promise.all([
+        const [r1h, r5m, r4h] = await Promise.all([
             fetchKlinesDetailed(symbol, '1h', 168, signal),
-            fetchKlinesDetailed(symbol, '5m', 100, signal)
+            fetchKlinesDetailed(symbol, '5m', 100, signal),
+            fetchKlinesDetailed(symbol, '4h', 100, signal)   // ~17 days of 4H structure
         ]);
 
         if (!r1h.ok || !r5m.ok) {
@@ -1074,6 +1326,16 @@ After searching, respond with ONLY this JSON object and no other text before or 
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
             candlesLTF: klines5m,
+            closes4H: r4h.ok ? r4h.klines.map(k => k.close) : null,
+            candles4H: r4h.ok ? r4h.klines.map(k => ({
+                open: k.open,
+                high: k.high,
+                low: k.low,
+                close: k.close,
+                volume: k.volume || 0,
+                time: k.openTime,
+                closeTime: k.closeTime
+            })) : null,
             dataQuality: {
                 stale: htfStale.stale || ltfStale.stale,
                 htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
@@ -1156,9 +1418,10 @@ After searching, respond with ONLY this JSON object and no other text before or 
     }
 
     async function fetchForexCandles(pair, apiKey, signal) {
-        const [r1h, r5m] = await Promise.all([
+        const [r1h, r5m, r4h] = await Promise.all([
             fetchForexSeriesDetailed(pair, '1h', 168, apiKey, signal),
-            fetchForexSeriesDetailed(pair, '5m', 100, apiKey, signal)
+            fetchForexSeriesDetailed(pair, '5m', 100, apiKey, signal),
+            fetchForexSeriesDetailed(pair, '4h', 100, apiKey, signal)   // ~17 days of 4H structure
         ]);
 
         if (!r1h.ok || !r5m.ok) {
@@ -1176,6 +1439,16 @@ After searching, respond with ONLY this JSON object and no other text before or 
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
             candlesLTF: klines5m,
+            closes4H: r4h.ok ? r4h.klines.map(k => k.close) : null,
+            candles4H: r4h.ok ? r4h.klines.map(k => ({
+                open: k.open,
+                high: k.high,
+                low: k.low,
+                close: k.close,
+                volume: k.volume || 0,
+                time: k.openTime,
+                closeTime: k.closeTime
+            })) : null,
             dataQuality: {
                 stale: htfStale.stale || ltfStale.stale,
                 htfAgeMinutes: Math.round(htfStale.ageMs / 60000),
@@ -1210,6 +1483,40 @@ After searching, respond with ONLY this JSON object and no other text before or 
             if (htfKlines[mid].closeTime <= timestamp) lo = mid + 1; else hi = mid;
         }
         return htfKlines.slice(Math.max(0, lo - count), lo).map(k => k.close);
+    }
+
+    // Same binary-search slice logic as getHTFSliceAsOf, but returns closes from the 4H klines array.
+    // Returns null (not an empty array) when the 4H data set is absent, so passesLocalFilter
+    // can distinguish "no data" from "data but zero bars" and skip the check cleanly.
+    function get4HSliceAsOf(klines4h, timestamp, count) {
+        if (!klines4h || klines4h.length === 0) return null;
+        let lo = 0, hi = klines4h.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (klines4h[mid].closeTime <= timestamp) lo = mid + 1; else hi = mid;
+        }
+        const slice = klines4h.slice(Math.max(0, lo - count), lo).map(k => k.close);
+        return slice.length >= 10 ? slice : null; // need at least 10 bars for a valid structure check
+    }
+
+    // Returns candle objects (not just closes) for HTF FVG detection
+    function get4HCandlesSliceAsOf(klines4h, timestamp, count) {
+        if (!klines4h || klines4h.length === 0) return null;
+        let lo = 0, hi = klines4h.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (klines4h[mid].closeTime <= timestamp) lo = mid + 1; else hi = mid;
+        }
+        const slice = klines4h.slice(Math.max(0, lo - count), lo).map(k => ({
+            open: k.open,
+            high: k.high,
+            low: k.low,
+            close: k.close,
+            volume: k.volume || 0,
+            time: k.openTime,
+            closeTime: k.closeTime
+        }));
+        return slice.length >= 10 ? slice : null;
     }
 
     const TRADING_FRICTION_PCT = 0.0015;
@@ -1247,7 +1554,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO, exitMode = 'sl', leverage = 10, maintMarginRate = 0.005) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO, exitMode = 'sl', leverage = 10, maintMarginRate = 0.005, klines4h = null) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1258,10 +1565,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             const closesHTFasOf = getHTFSliceAsOf(htfKlines, bar.closeTime, 168);
             const candlesLTFasOf = ltfKlines.slice(Math.max(0, i - minLTFWindow), i + 1);
+            const closes4HasOf = get4HSliceAsOf(klines4h, bar.closeTime, 50);
+            const candles4HasOf = get4HCandlesSliceAsOf(klines4h, bar.closeTime, 50);
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio, closes4HasOf, candles4HasOf);
                 if (filterResult.pass) {
                     // computeTradeLevels is used in backtesting (fixed RR),
                     // so the fibExtension rejection path in computeAdaptiveTradeLevels
@@ -1322,16 +1631,19 @@ After searching, respond with ONLY this JSON object and no other text before or 
         if (marketType === 'forex') {
             const outputsize1h = Math.min(5000, Math.ceil(historyDays * 24));
             const outputsize5m = Math.min(5000, Math.ceil(historyDays * 24 * 12));
+            const outputsize4h = Math.min(5000, Math.ceil(historyDays * 6));
             const r1h = await fetchForexSeriesDetailed(symbolOrPair, '1h', outputsize1h, twelveDataKey, signal);
             if (!r1h.ok) return { ok: false, reason: r1h.reason, detail: r1h.detail };
             const r5m = await fetchForexSeriesDetailed(symbolOrPair, '5m', outputsize5m, twelveDataKey, signal);
             if (!r5m.ok) return { ok: false, reason: r5m.reason, detail: r5m.detail };
-            return { ok: true, klines1h: r1h.klines, klines5m: r5m.klines };
+            const r4h = await fetchForexSeriesDetailed(symbolOrPair, '4h', outputsize4h, twelveDataKey, signal);
+            return { ok: true, klines1h: r1h.klines, klines5m: r5m.klines, klines4h: r4h.ok ? r4h.klines : [] };
         }
         const klines1h = await fetchKlinesRange(symbolOrPair, '1h', historyDays, signal);
         const klines5m = await fetchKlinesRange(symbolOrPair, '5m', historyDays, signal);
+        const klines4h = await fetchKlinesRange(symbolOrPair, '4h', historyDays, signal);
         if (!klines1h || !klines1h.length || !klines5m || !klines5m.length) return { ok: false, reason: 'no_pair', detail: 'No Binance pair or fetch failed' };
-        return { ok: true, klines1h, klines5m };
+        return { ok: true, klines1h, klines5m, klines4h: klines4h || [] };
     }
 
     async function runBacktest() {
@@ -1372,12 +1684,12 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 btLogFn(`Could not fetch history for ${symbolOrPair}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''}`, 'error');
                 return;
             }
-            const { klines1h, klines5m } = fetched;
-            btLogFn(`Got ${klines1h.length} 1h candles and ${klines5m.length} 5m candles.`);
+            const { klines1h, klines5m, klines4h } = fetched;
+            btLogFn(`Got ${klines1h.length} 1h candles, ${klines5m.length} 5m candles${klines4h && klines4h.length ? `, ${klines4h.length} 4h candles` : ' (no 4H data)'}.`);
             btLogFn(`Replaying local filter logic | confluence score threshold: ${config.minConfluenceScore}%${config.killzoneOnly ? ' | KILL ZONE ONLY' : ''}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
             const isLiqMode = config.exitMode === 'liquidation';
@@ -1540,8 +1852,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     blog(`${symbol}: ${fetched.reason}${fetched.detail ? ' - ' + fetched.detail : ''} - skipped.`, 'error');
                     continue;
                 }
-                symbolData.push({ symbol, klines1h: fetched.klines1h, klines5m: fetched.klines5m });
-                blog(`${symbol}: got ${fetched.klines1h.length} 1h / ${fetched.klines5m.length} 5m candles.`);
+                symbolData.push({ symbol, klines1h: fetched.klines1h, klines5m: fetched.klines5m, klines4h: fetched.klines4h || null });
+                blog(`${symbol}: got ${fetched.klines1h.length} 1h / ${fetched.klines5m.length} 5m${fetched.klines4h && fetched.klines4h.length ? ` / ${fetched.klines4h.length} 4h` : ''} candles.`);
                 await sleep(marketType === 'forex' ? 400 : 200);
             }
 
@@ -1559,9 +1871,9 @@ After searching, respond with ONLY this JSON object and no other text before or 
                     rrValues.forEach(rr => {
                         let allTrades = [];
                         let longCount = 0, shortCount = 0;
-                        symbolData.forEach(({ klines1h, klines5m }) => {
-                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
-                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct);
+                        symbolData.forEach(({ klines1h, klines5m, klines4h }) => {
+                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
+                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
                             longCount += longTrades.length;
                             shortCount += shortTrades.length;
                             allTrades = allTrades.concat(longTrades, shortTrades);
@@ -2149,7 +2461,10 @@ Respond ONLY with valid JSON:
         const scoreText = (trade.confluenceScore !== null && trade.confluenceScore !== undefined)
             ? `<div class="row"><strong>Confluence score: ${trade.confluenceScore.toFixed(0)}%</strong>${trade.confluenceBreakdown ? ` - passed: ${trade.confluenceBreakdown.passed.join(', ') || 'none'}${trade.confluenceBreakdown.failed.length ? `; missing: ${trade.confluenceBreakdown.failed.join(', ')}` : ''}` : ''}</div>`
             : '';
-        return `${scoreText}<div class="row">${sweepText} | ${fvgText}</div>`;
+        const obText = trade.obLabel
+            ? `<div class="row muted">OB: ${trade.obLabel}</div>`
+            : '';
+        return `${scoreText}<div class="row">${sweepText} | ${fvgText}</div>${obText}`;
     }
 
     function renderTPModeSection(trade) {
@@ -2469,7 +2784,8 @@ Respond ONLY with valid JSON:
             const skipVolumeCheck = marketType === 'forex';
             const filterResult = passesLocalFilter(
                 closedHTF, closedLTF, currentPrice, dir,
-                config.confluenceWeights, config.minConfluenceScore, skipVolumeCheck, config.volumeDisplacementRatio
+                config.confluenceWeights, config.minConfluenceScore, skipVolumeCheck, config.volumeDisplacementRatio,
+                candles.closes4H ? candles.closes4H.slice(0, -1) : null
             );
 
             trade.revalidation = filterResult.pass
@@ -2586,7 +2902,7 @@ Respond ONLY with valid JSON:
             return { success: false, reason: `CoinGecko/Binance price mismatch (${priceCheck.diffPct.toFixed(1)}%)` };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, false, config.volumeDisplacementRatio);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, false, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
@@ -2666,6 +2982,7 @@ Respond ONLY with valid JSON:
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
+                obLabel: filterResult.obResult ? filterResult.obResult.obLabel : null,
                 tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
             }
         };
@@ -2691,7 +3008,7 @@ Respond ONLY with valid JSON:
         }
 
         const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, true, config.volumeDisplacementRatio);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, true, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
@@ -2745,6 +3062,7 @@ Respond ONLY with valid JSON:
                 fvgRange: filterResult.fvgMatch ? { top: filterResult.fvgMatch.top, bottom: filterResult.fvgMatch.bottom } : null,
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
+                obLabel: filterResult.obResult ? filterResult.obResult.obLabel : null,
                 tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
             }
         };
