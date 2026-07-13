@@ -157,7 +157,23 @@
         <div>
             <label for="circuitBreakerEnabled" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
                 <input type="checkbox" id="circuitBreakerEnabled" style="width:auto; margin:0;" checked>
-                Enable circuit breaker (pause new entries after rolling 24h loss &ge; 3% of account)
+                Enable circuit breaker (rolling 24h loss &ge; 3% of account, or 3/5/7 consecutive losses)
+            </label>
+        </div>
+        <div>
+            <label for="signalDecayEnabled" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
+                <input type="checkbox" id="signalDecayEnabled" style="width:auto; margin:0;">
+                Signal decay (penalize confluence score for stale liquidity sweeps)
+            </label>
+        </div>
+        <div>
+            <label for="signalDecayTau">Signal decay tau (bars to half-life-ish decay; lower = stricter)</label>
+            <input type="number" id="signalDecayTau" value="15" min="1" step="1">
+        </div>
+        <div>
+            <label for="atrSizingEnabled" style="display:flex; align-items:center; gap:6px; margin-top:14px;">
+                <input type="checkbox" id="atrSizingEnabled" style="width:auto; margin:0;">
+                ATR-scaled position sizing (shrink size further when current ATR &gt; 1.5x its recent average)
             </label>
         </div>
         <div>
@@ -283,6 +299,15 @@
     <div id="journalList" style="margin-top:8px; max-height:280px; overflow:auto; font-size:13px;"></div>
 </details>
 
+<details style="margin-top:12px; background:white; border-radius:5px; padding:8px;">
+    <summary><strong>Win-Rate / Expectancy Matrix</strong> - resolved journal trades bucketed by regime &times; session</summary>
+    <p class="muted">Only trades logged after this feature was added carry a regime/session tag, so older journal entries fall into "Untagged" until you've logged fresh ones. Cells need at least 5 resolved trades before the EV number means much - treat anything below that as a preview, not a signal.</p>
+    <label for="costPctOfR">Estimated round-trip cost (% of 1R, for practical EV)</label>
+    <input type="number" id="costPctOfR" value="10" min="0" step="1">
+    <button id="matrixRefreshBtn" onclick="renderWinRateMatrix()">Refresh Matrix</button>
+    <div id="winRateMatrix" style="margin-top:8px; overflow-x:auto; font-size:13px;"></div>
+</details>
+
 <div class="progress-wrap" id="progressWrap">
     <div class="progress-bar" id="progressBar">0%</div>
 </div>
@@ -297,7 +322,7 @@
     // ------------------------------------------------------------------
     // Config persistence (never persist the API key)
     // ------------------------------------------------------------------
-    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'weightOb', 'weightHtfStructure', 'weightCHoCHRecency', 'weightInducementSweep', 'weightHTFFVG', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct', 'limitOnlySignals'];
+    const CONFIG_KEYS = ['marketType', 'accountBalance', 'riskPercent', 'momentumThreshold', 'backtestHistoryDays', 'targetRR', 'candidateCount', 'geminiRpm', 'twelveDataRpm', 'killzoneOnly', 'circuitBreakerEnabled', 'tpMode', 'extensionRatio', 'minRRFloor', 'displayTimezone', 'forexPairs', 'volumeDisplacementRatio', 'minConfluenceScore', 'weightSma', 'weightStructure', 'weightOte', 'weightSweep', 'weightFvg', 'weightVolume', 'weightOb', 'weightHtfStructure', 'weightCHoCHRecency', 'weightInducementSweep', 'weightHTFFVG', 'slBufferRatio', 'exitMode', 'leverage', 'maintMarginPct', 'limitOnlySignals', 'signalDecayEnabled', 'signalDecayTau', 'atrSizingEnabled', 'costPctOfR'];
 
     function loadConfig() {
         CONFIG_KEYS.forEach(key => {
@@ -355,6 +380,9 @@
             leverage: Math.max(1, Math.min(125, parseFloat(document.getElementById('leverage').value) || 10)),
             maintMarginPct: Math.max(0, Math.min(10, parseFloat(document.getElementById('maintMarginPct').value) || 0.5)) / 100,
             limitOnlySignals: document.getElementById('limitOnlySignals').checked,
+            signalDecayEnabled: document.getElementById('signalDecayEnabled').checked,
+            signalDecayTau: Math.max(1, parseFloat(document.getElementById('signalDecayTau').value) || 15),
+            atrSizingEnabled: document.getElementById('atrSizingEnabled').checked,
             displayTimezone: document.getElementById('displayTimezone').value,
             forexPairs: document.getElementById('forexPairs').value.split(',').map(s => s.trim()).filter(Boolean)
         };
@@ -718,6 +746,140 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { ok: ratio >= ratioThreshold, ratio };
     }
 
+    // ------------------------------------------------------------------
+    // ATR, market regime, fill probability, signal decay, expectancy
+    // ------------------------------------------------------------------
+    function calculateATR(candles, period = 14) {
+        if (!candles || candles.length < period + 1) return null;
+        const trs = [];
+        for (let i = 1; i < candles.length; i++) {
+            const cur = candles[i], prev = candles[i - 1];
+            const tr = Math.max(
+                cur.high - cur.low,
+                Math.abs(cur.high - prev.close),
+                Math.abs(cur.low - prev.close)
+            );
+            trs.push(tr);
+        }
+        const recent = trs.slice(-period);
+        if (recent.length === 0) return null;
+        return recent.reduce((a, b) => a + b, 0) / recent.length;
+    }
+
+    // Rolling ATR series, used to establish a "normal" baseline ATR for
+    // comparison (regime detection, ATR-scaled sizing).
+    function calculateATRSeries(candles, period = 14) {
+        const series = [];
+        for (let i = period + 1; i <= candles.length; i++) {
+            const atr = calculateATR(candles.slice(0, i), period);
+            if (atr !== null) series.push(atr);
+        }
+        return series;
+    }
+
+    // Market regime classifier for the HTF (1h) timeframe.
+    // Combines ATR-rank (volatility expansion), Bollinger Band width
+    // (compression/ranging), and 20-SMA slope (directional trend) into a
+    // single label. This is pure price-derived state, not a new signal -
+    // it's used to bucket setups after the fact (win-rate matrix) and to
+    // flag conditions worth a second look (HighVol) before sizing a trade.
+    function classifyRegime(candlesHTF) {
+        if (!candlesHTF || candlesHTF.length < 60) {
+            return { regime: 'Unknown', reason: 'Insufficient HTF history' };
+        }
+        const closes = candlesHTF.map(c => c.close);
+        const atrNow = calculateATR(candlesHTF, 14);
+        const atrSeries = calculateATRSeries(candlesHTF.slice(-60), 14);
+        if (atrNow === null || atrSeries.length < 10) {
+            return { regime: 'Unknown', reason: 'Insufficient ATR history' };
+        }
+        const atrAvg = atrSeries.reduce((a, b) => a + b, 0) / atrSeries.length;
+        const atrRatio = atrAvg > 0 ? atrNow / atrAvg : 1;
+
+        const bbPeriod = 20;
+        const bbSlice = closes.slice(-bbPeriod);
+        const bbMean = bbSlice.reduce((a, b) => a + b, 0) / bbPeriod;
+        const variance = bbSlice.reduce((s, v) => s + Math.pow(v - bbMean, 2), 0) / bbPeriod;
+        const stdDev = Math.sqrt(variance);
+        const bbWidthPct = bbMean > 0 ? (4 * stdDev / bbMean) * 100 : 0;
+
+        const sma20Now = calculateSMA(closes, 20);
+        const sma20Then = closes.length >= 30 ? calculateSMA(closes.slice(0, closes.length - 10), 20) : null;
+        const smaSlopePct = (sma20Then && sma20Now) ? ((sma20Now - sma20Then) / sma20Then) * 100 : 0;
+
+        let regime;
+        if (atrRatio >= 1.5) {
+            regime = 'HighVol';
+        } else if (bbWidthPct < 3 && Math.abs(smaSlopePct) < 0.5) {
+            regime = 'Ranging';
+        } else if (smaSlopePct > 0.5) {
+            regime = 'Trending↑';
+        } else if (smaSlopePct < -0.5) {
+            regime = 'Trending↓';
+        } else {
+            regime = 'Transitioning';
+        }
+
+        return { regime, atrRatio, bbWidthPct, smaSlopePct, atrNow, atrAvg };
+    }
+
+    // Entry difficulty / fill probability: distance from current price to the
+    // optimal (limit) entry, expressed in ATR units on the execution timeframe.
+    // This is a heuristic, not a measured probability - it exists to flag
+    // "this limit order is realistically far away" before you commit to it.
+    function computeFillProbability(currentPrice, optimalEntry, atr) {
+        if (!atr || atr <= 0) return { label: 'UNKNOWN', prob: null, atrDistance: null };
+        const distance = Math.abs(currentPrice - optimalEntry);
+        const atrDistance = distance / atr;
+        let label, prob;
+        if (atrDistance <= 0.25) { label = 'EASY'; prob = 0.85; }
+        else if (atrDistance <= 0.75) { label = 'MODERATE'; prob = 0.60; }
+        else if (atrDistance <= 1.5) { label = 'HARD'; prob = 0.35; }
+        else { label = 'VERY HARD'; prob = 0.15; }
+        return { label, prob, atrDistance };
+    }
+
+    // Signal decay: multiplicative penalty on the confluence score based on
+    // how many bars have passed since the triggering liquidity sweep. A sweep
+    // from 1-2 bars ago is fresh; the same sweep still being "true" 12+ bars
+    // later shouldn't score identically - price has had time to move on.
+    // Floor of 0.5 so decay narrows the score, never zeroes out an otherwise
+    // valid setup on its own.
+    function computeSignalDecay(barsSinceSweep, tau = 15) {
+        if (barsSinceSweep === null || barsSinceSweep === undefined) return 1;
+        return Math.max(0.5, Math.exp(-barsSinceSweep / tau));
+    }
+
+    // Practical expectancy in R, after estimated round-trip friction.
+    // winRatePct: 0-100 (from the win-rate matrix bucket, or overall journal).
+    // avgWinR: average R multiple on wins (normally = targetRR).
+    // costPctOfR: round-trip friction (spread+slippage+fees) as a fraction of 1R.
+    function computeExpectancy(winRatePct, avgWinR, costPctOfR = 0) {
+        if (winRatePct === null || winRatePct === undefined || avgWinR === null || avgWinR === undefined) return null;
+        const w = winRatePct / 100;
+        const rawEV = (w * avgWinR) - ((1 - w) * 1);
+        const practicalEV = rawEV - costPctOfR;
+        return { rawEV, practicalEV };
+    }
+
+    // ATR-scaled position sizing: layered on top of the normal SL-distance
+    // risk sizing. When current ATR has expanded well beyond its recent
+    // average, the structural SL distance often hasn't caught up yet - this
+    // shrinks size further in that case. It never scales size UP; a quiet
+    // market doesn't get a size bonus, only an expanded one gets a haircut.
+    function computePositionSizeATR(entry, sl, accountBalance, riskPercent, atrNow, atrAvg) {
+        const base = computePositionSize(entry, sl, accountBalance, riskPercent);
+        if (!atrNow || !atrAvg || atrAvg <= 0) return { ...base, atrScale: 1 };
+        const atrRatio = atrNow / atrAvg;
+        const atrScale = atrRatio > 1.5 ? (1.5 / atrRatio) : 1;
+        return {
+            units: base.units * atrScale,
+            positionUSD: base.positionUSD * atrScale,
+            riskAmount: base.riskAmount * atrScale,
+            atrScale
+        };
+    }
+
     function findFractalHighLowCandles(candles, wing = 2) {
         const highs = [], lows = [];
         for (let i = wing; i < candles.length - wing; i++) {
@@ -735,26 +897,27 @@ After searching, respond with ONLY this JSON object and no other text before or 
     const SWEEP_LOOKBACK_BARS = 12;
 
     function detectLiquiditySweep(candlesLTF, direction, wing = 2) {
-        if (!candlesLTF || candlesLTF.length < wing * 2 + 5) return { swept: false, level: null };
+        if (!candlesLTF || candlesLTF.length < wing * 2 + 5) return { swept: false, level: null, barsAgo: null };
         const { highs, lows } = findFractalHighLowCandles(candlesLTF, wing);
         const pivots = direction === 'bullish' ? lows : highs;
-        if (pivots.length < 2) return { swept: false, level: null };
+        if (pivots.length < 2) return { swept: false, level: null, barsAgo: null };
 
         const reference = pivots[pivots.length - 2];
         const recentBars = candlesLTF.slice(-SWEEP_LOOKBACK_BARS);
 
-        for (const bar of recentBars) {
+        for (let i = 0; i < recentBars.length; i++) {
+            const bar = recentBars[i];
             if (direction === 'bullish') {
                 if (bar.low < reference.price && bar.close > reference.price) {
-                    return { swept: true, level: reference.price };
+                    return { swept: true, level: reference.price, barsAgo: recentBars.length - 1 - i };
                 }
             } else {
                 if (bar.high > reference.price && bar.close < reference.price) {
-                    return { swept: true, level: reference.price };
+                    return { swept: true, level: reference.price, barsAgo: recentBars.length - 1 - i };
                 }
             }
         }
-        return { swept: false, level: reference.price };
+        return { swept: false, level: reference.price, barsAgo: null };
     }
 
     function findFVGs(candlesLTF, direction) {
@@ -889,7 +1052,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         };
     }
 
-    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT, closes4H = null, candles4H = null) {
+    function passesLocalFilter(closesHTF, candlesLTF, currentPrice, direction, weights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio = VOLUME_DISPLACEMENT_RATIO_DEFAULT, closes4H = null, candles4H = null, signalDecayEnabled = false, signalDecayTau = 15) {
         const closesLTF = candlesLTF.map(c => c.close);
         const volumesLTF = candlesLTF.map(c => c.volume);
 
@@ -975,9 +1138,19 @@ After searching, respond with ONLY this JSON object and no other text before or 
         const maxScore = factors.reduce((s, f) => s + (f.score !== undefined ? f.weight : f.weight), 0) + obWeight;
         // Achieved: binary pass + graduated scores + OB partial score
         const achieved = factors.filter(f => f.ok).reduce((s, f) => s + (f.score !== undefined ? f.score : f.weight), 0) + obResult.obScore;
-        const scorePct = maxScore > 0 ? (achieved / maxScore * 100) : 0;
+        const scorePctRaw = maxScore > 0 ? (achieved / maxScore * 100) : 0;
+
+        // Signal decay: penalize confluence score for stale sweeps. Applied
+        // after the raw score so it narrows a passing score rather than
+        // creating a new gate of its own.
+        const decayFactor = signalDecayEnabled ? computeSignalDecay(sweep.barsAgo, signalDecayTau) : 1;
+        const scorePct = scorePctRaw * decayFactor;
+
         const passedLabels = factors.filter(f => f.ok).map(f => f.label);
         const failedLabels = factors.filter(f => !f.ok).map(f => f.label);
+        if (signalDecayEnabled && decayFactor < 1) {
+            passedLabels.push(`Signal decay: ${(decayFactor * 100).toFixed(0)}% (sweep ${sweep.barsAgo} bars ago)`);
+        }
 
         // OB label handling
         if (obWeight > 0) {
@@ -996,7 +1169,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return {
             pass: true, sma, swing, volumeRatio: volCheck ? volCheck.ratio : null, sweep, fvgMatch, dualWicks,
             obResult,
-            confluenceScore: scorePct, confluenceBreakdown: { passed: passedLabels, failed: failedLabels },
+            confluenceScore: scorePct, confluenceScoreRaw: scorePctRaw, decayFactor,
+            confluenceBreakdown: { passed: passedLabels, failed: failedLabels },
             dualWickSignal: dualWicks.signal,
             chochResult, inducement, htfFvgMatch
         };
@@ -1323,6 +1497,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return {
             ok: true,
             closesHTF: klines1h.map(k => k.close),
+            candlesHTF: klines1h,
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
             candlesLTF: klines5m,
@@ -1436,6 +1611,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return {
             ok: true,
             closesHTF: klines1h.map(k => k.close),
+            candlesHTF: klines1h,
             closesLTF: klines5m.map(k => k.close),
             volumesLTF: klines5m.map(k => k.volume),
             candlesLTF: klines5m,
@@ -1554,7 +1730,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         return { outcome: 'timeout', rrAchieved: rrAchievedRaw - frictionR, frictionR, exitIndex: endIndex };
     }
 
-    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO, exitMode = 'sl', leverage = 10, maintMarginRate = 0.005, klines4h = null) {
+    function backtestDirection(ltfKlines, htfKlines, direction, targetRR, maxHoldBars, confluenceWeights, minConfluenceScore, killzoneOnly, skipVolumeCheck, volumeDisplacementRatio, slBufferRatio = STRUCTURAL_BUFFER_RATIO, exitMode = 'sl', leverage = 10, maintMarginRate = 0.005, klines4h = null, signalDecayEnabled = false, signalDecayTau = 15) {
         const trades = [];
         const minHTF = 24, minLTFWindow = 50;
         let i = minLTFWindow;
@@ -1570,7 +1746,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
 
             if (closesHTFasOf.length >= minHTF) {
                 const currentPrice = bar.close;
-                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio, closes4HasOf, candles4HasOf);
+                const filterResult = passesLocalFilter(closesHTFasOf, candlesLTFasOf, currentPrice, direction, confluenceWeights, minConfluenceScore, skipVolumeCheck, volumeDisplacementRatio, closes4HasOf, candles4HasOf, signalDecayEnabled, signalDecayTau);
                 if (filterResult.pass) {
                     // computeTradeLevels is used in backtesting (fixed RR),
                     // so the fibExtension rejection path in computeAdaptiveTradeLevels
@@ -1688,8 +1864,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
             btLogFn(`Got ${klines1h.length} 1h candles, ${klines5m.length} 5m candles${klines4h && klines4h.length ? `, ${klines4h.length} 4h candles` : ' (no 4H data)'}.`);
             btLogFn(`Replaying local filter logic | confluence score threshold: ${config.minConfluenceScore}%${config.killzoneOnly ? ' | KILL ZONE ONLY' : ''}...\n`);
 
-            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
-            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
+            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null, config.signalDecayEnabled, config.signalDecayTau);
+            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', config.targetRR, maxHoldBars, config.confluenceWeights, config.minConfluenceScore, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, config.slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null, config.signalDecayEnabled, config.signalDecayTau);
             const longStats = summarizeBacktest(longTrades);
             const shortStats = summarizeBacktest(shortTrades);
             const isLiqMode = config.exitMode === 'liquidation';
@@ -1872,8 +2048,8 @@ After searching, respond with ONLY this JSON object and no other text before or 
                         let allTrades = [];
                         let longCount = 0, shortCount = 0;
                         symbolData.forEach(({ klines1h, klines5m, klines4h }) => {
-                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
-                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null);
+                            const longTrades = backtestDirection(klines5m, klines1h, 'bullish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null, config.signalDecayEnabled, config.signalDecayTau);
+                            const shortTrades = backtestDirection(klines5m, klines1h, 'bearish', rr, maxHoldBars, config.confluenceWeights, score, config.killzoneOnly, skipVolumeCheck, config.volumeDisplacementRatio, slBufferRatio, config.exitMode, config.leverage, config.maintMarginPct, klines4h || null, config.signalDecayEnabled, config.signalDecayTau);
                             longCount += longTrades.length;
                             shortCount += shortTrades.length;
                             allTrades = allTrades.concat(longTrades, shortTrades);
@@ -2038,9 +2214,15 @@ After searching, respond with ONLY this JSON object and no other text before or 
             fvgConfluence: trade.fvgConfluence !== undefined ? trade.fvgConfluence : null,
             fvgRange: trade.fvgRange || null,
             confluenceScore: trade.confluenceScore !== undefined ? trade.confluenceScore : null,
+            confluenceScoreRaw: trade.confluenceScoreRaw !== undefined ? trade.confluenceScoreRaw : null,
+            decayFactor: trade.decayFactor !== undefined ? trade.decayFactor : null,
             confluenceBreakdown: trade.confluenceBreakdown || null,
             tpMode: trade.tpMode || null,
             extensionRatioUsed: trade.extensionRatioUsed || null,
+            regime: trade.regime || null,
+            session: trade.session || null,
+            fillProbability: trade.fillProbability || null,
+            atrScale: trade.atrScale !== undefined ? trade.atrScale : null,
             loggedAt: Date.now(),
             status: 'pending',
             resolvedAt: null,
@@ -2107,6 +2289,89 @@ After searching, respond with ONLY this JSON object and no other text before or 
                 </details>
             `;
         }).join('');
+    }
+
+    // ------------------------------------------------------------------
+    // Win-rate / expectancy matrix: buckets resolved journal trades by
+    // regime x session and computes win% + practical EV per bucket.
+    // This is descriptive (what actually happened), not predictive -
+    // it's meant to show you which regime/session combos your setups
+    // actually work in, same spirit as the existing regime-split backtest.
+    // ------------------------------------------------------------------
+    const MATRIX_MIN_SAMPLE = 5;
+
+    function buildWinRateMatrix(journal, costPctOfR = 0) {
+        const resolved = journal.filter(e => (e.status === 'win' || e.status === 'loss') && e.rrAchieved !== null);
+        const buckets = {};
+        for (const e of resolved) {
+            const regime = e.regime || 'Untagged';
+            const session = e.session || 'Untagged';
+            const key = `${regime}|${session}`;
+            if (!buckets[key]) buckets[key] = { regime, session, wins: 0, losses: 0, rSum: 0, winRSum: 0, winCount: 0 };
+            const b = buckets[key];
+            if (e.status === 'win') { b.wins++; b.winRSum += e.rrAchieved; b.winCount++; }
+            else b.losses++;
+            b.rSum += e.rrAchieved;
+        }
+        return Object.values(buckets).map(b => {
+            const total = b.wins + b.losses;
+            const winRatePct = total > 0 ? (b.wins / total) * 100 : null;
+            const avgWinR = b.winCount > 0 ? b.winRSum / b.winCount : null;
+            const avgR = total > 0 ? b.rSum / total : null;
+            const ev = (winRatePct !== null && avgWinR !== null) ? computeExpectancy(winRatePct, avgWinR, costPctOfR / 100) : null;
+            return {
+                regime: b.regime, session: b.session, total, wins: b.wins, losses: b.losses,
+                winRatePct, avgR, ev,
+                lowSample: total < MATRIX_MIN_SAMPLE
+            };
+        }).sort((a, b) => b.total - a.total);
+    }
+
+    function renderWinRateMatrix() {
+        const journal = loadJournal();
+        const costPctOfR = Math.max(0, parseFloat(document.getElementById('costPctOfR').value) || 0);
+        const rows = buildWinRateMatrix(journal, costPctOfR);
+        const el = document.getElementById('winRateMatrix');
+        if (rows.length === 0) {
+            el.innerHTML = '<div class="row muted">No resolved trades yet - run \'Check Outcomes\' in the journal above first.</div>';
+            return;
+        }
+        el.innerHTML = `
+            <table style="width:100%; border-collapse:collapse;">
+                <thead>
+                    <tr style="text-align:left; border-bottom:2px solid #ddd;">
+                        <th style="padding:4px 8px;">Regime</th>
+                        <th style="padding:4px 8px;">Session</th>
+                        <th style="padding:4px 8px;">N</th>
+                        <th style="padding:4px 8px;">Win%</th>
+                        <th style="padding:4px 8px;">Avg R</th>
+                        <th style="padding:4px 8px;">Practical EV (R)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rows.map(r => `
+                        <tr style="border-bottom:1px solid #eee; ${r.lowSample ? 'color:#999;' : ''}">
+                            <td style="padding:4px 8px;">${r.regime}</td>
+                            <td style="padding:4px 8px;">${r.session}</td>
+                            <td style="padding:4px 8px;">${r.total}${r.lowSample ? ' (low N)' : ''}</td>
+                            <td style="padding:4px 8px;">${r.winRatePct !== null ? r.winRatePct.toFixed(1) + '%' : '-'}</td>
+                            <td style="padding:4px 8px;">${r.avgR !== null ? r.avgR.toFixed(2) : '-'}</td>
+                            <td style="padding:4px 8px; ${r.ev && r.ev.practicalEV < 0 ? 'color:#dc3545;' : r.ev && r.ev.practicalEV > 0 ? 'color:#28a745;' : ''}">${r.ev ? r.ev.practicalEV.toFixed(2) : '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+    }
+
+    // Looks up the matrix bucket matching a live candidate's regime/session,
+    // for display on the trade card. Returns null if there's no data yet or
+    // the sample is below the minimum.
+    function lookupExpectancy(regime, session, costPctOfR = 0) {
+        const journal = loadJournal();
+        const rows = buildWinRateMatrix(journal, costPctOfR);
+        const match = rows.find(r => r.regime === regime && r.session === session && !r.lowSample);
+        return match || null;
     }
 
     async function checkJournalOutcomes() {
@@ -2179,6 +2444,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         } finally {
             btn.disabled = false;
             renderJournal();
+            renderWinRateMatrix();
             checkCircuitBreaker(getConfig());
             renderCircuitBreakerStatus();
         }
@@ -2188,6 +2454,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
         if (!confirm('Clear all journaled trades? This cannot be undone.')) return;
         localStorage.removeItem(JOURNAL_KEY);
         renderJournal();
+        renderWinRateMatrix();
     }
 
     // ------------------------------------------------------------------
@@ -2218,6 +2485,28 @@ After searching, respond with ONLY this JSON object and no other text before or 
             .reduce((sum, e) => sum + (e.rrAchieved * e.riskAmount), 0);
     }
 
+    // Consecutive-loss tiers: 3 losses in a row = short cooldown (warning
+    // level, still allows trading but flags it), 5 = longer pause, 7 = full
+    // 24h pause. Checked against the most recent resolved (win/loss) journal
+    // entries, most-recent-first, stopping at the first win.
+    const CONSEC_LOSS_TIERS = [
+        { count: 7, pauseMs: 24 * 60 * 60 * 1000, label: '7 consecutive losses' },
+        { count: 5, pauseMs: 4 * 60 * 60 * 1000, label: '5 consecutive losses' },
+        { count: 3, pauseMs: 60 * 60 * 1000, label: '3 consecutive losses' }
+    ];
+
+    function getConsecutiveLosses(journal) {
+        const resolved = journal
+            .filter(e => e.status === 'win' || e.status === 'loss')
+            .sort((a, b) => (b.resolvedAt || 0) - (a.resolvedAt || 0));
+        let streak = 0;
+        for (const e of resolved) {
+            if (e.status === 'loss') streak++;
+            else break;
+        }
+        return streak;
+    }
+
     function checkCircuitBreaker(config) {
         // ── KEY CHANGE: honour the toggle ────────────────────────────────────
         if (!config.circuitBreakerEnabled) return { blocked: false, message: null };
@@ -2230,18 +2519,39 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const hrs = Math.floor(remainingMin / 60), mins = remainingMin % 60;
             return {
                 blocked: true,
-                message: `Circuit breaker active: rolling 24h loss hit ${existing.lossPct.toFixed(1)}% of account on ${new Date(existing.triggeredAt).toLocaleString()}. Paused for ${hrs}h ${mins}m more.`
+                message: `Circuit breaker active: ${existing.reason} on ${new Date(existing.triggeredAt).toLocaleString()}. Paused for ${hrs}h ${mins}m more.`
             };
         }
 
         if (existing) saveBreakerState(null);
 
         const journal = loadJournal();
+
+        // Consecutive-loss tiers checked first (highest tier wins)
+        const consecLosses = getConsecutiveLosses(journal);
+        for (const tier of CONSEC_LOSS_TIERS) {
+            if (consecLosses >= tier.count) {
+                const state = {
+                    triggeredAt: now, expiresAt: now + tier.pauseMs,
+                    reason: `${tier.label} (${consecLosses} total)`, lossPct: null
+                };
+                saveBreakerState(state);
+                const hrs = Math.floor(tier.pauseMs / 3600000);
+                return {
+                    blocked: true,
+                    message: `Circuit breaker triggered: ${tier.label} (${consecLosses} total). Paused for ${hrs}h.`
+                };
+            }
+        }
+
         const pnl = getRollingPnL(journal, CIRCUIT_BREAKER_WINDOW_MS);
         const lossPct = pnl < 0 ? (Math.abs(pnl) / config.accountBalance) * 100 : 0;
 
         if (lossPct >= CIRCUIT_BREAKER_LOSS_PCT) {
-            const state = { triggeredAt: now, expiresAt: now + CIRCUIT_BREAKER_WINDOW_MS, lossPct };
+            const state = {
+                triggeredAt: now, expiresAt: now + CIRCUIT_BREAKER_WINDOW_MS,
+                reason: `rolling 24h loss hit ${lossPct.toFixed(1)}% of account`, lossPct
+            };
             saveBreakerState(state);
             return {
                 blocked: true,
@@ -2261,7 +2571,7 @@ After searching, respond with ONLY this JSON object and no other text before or 
             const remainingMin = Math.ceil((existing.expiresAt - now) / 60000);
             const hrs = Math.floor(remainingMin / 60), mins = remainingMin % 60;
             el.style.display = 'block';
-            el.innerHTML = `<strong>Circuit breaker ACTIVE</strong> - rolling 24h loss reached ${existing.lossPct.toFixed(1)}% of account. Paused for ${hrs}h ${mins}m more.`;
+            el.innerHTML = `<strong>Circuit breaker ACTIVE</strong> - ${existing.reason || (existing.lossPct !== null && existing.lossPct !== undefined ? `rolling 24h loss reached ${existing.lossPct.toFixed(1)}% of account` : 'triggered')}. Paused for ${hrs}h ${mins}m more.`;
         } else {
             el.style.display = 'none';
             el.innerHTML = '';
@@ -2476,6 +2786,28 @@ Respond ONLY with valid JSON:
         return '';
     }
 
+    function renderRegimeSection(trade) {
+        if (!trade.regime || trade.regime === 'Unknown') return '';
+        const decayText = (trade.decayFactor !== undefined && trade.decayFactor !== null && trade.decayFactor < 1)
+            ? ` | Signal decay: ${(trade.decayFactor * 100).toFixed(0)}% of raw ${trade.confluenceScoreRaw !== null ? trade.confluenceScoreRaw.toFixed(0) + '%' : '?'}`
+            : '';
+        const fillText = trade.fillProbability
+            ? `Fill: ${trade.fillProbability}${trade.fillProbAtrDistance !== null && trade.fillProbAtrDistance !== undefined ? ` (${trade.fillProbAtrDistance.toFixed(2)} ATR away)` : ''}`
+            : '';
+        const atrScaleText = (trade.atrScale !== undefined && trade.atrScale !== null && trade.atrScale < 1)
+            ? ` | ATR sizing: ${(trade.atrScale * 100).toFixed(0)}% of normal size (elevated volatility)`
+            : '';
+
+        const costPctEl = document.getElementById('costPctOfR');
+        const costPctOfR = costPctEl ? (parseFloat(costPctEl.value) || 0) : 0;
+        const expectancy = trade.session ? lookupExpectancy(trade.regime, trade.session, costPctOfR) : null;
+        const evText = expectancy
+            ? ` | Setup EV (${expectancy.regime}/${expectancy.session}, n=${expectancy.total}): <strong style="color:${expectancy.ev.practicalEV >= 0 ? '#28a745' : '#dc3545'}">${expectancy.ev.practicalEV.toFixed(2)}R</strong>`
+            : ` | Setup EV: insufficient journal history for this regime/session yet`;
+
+        return `<div class="row muted">Regime: ${trade.regime}${trade.session ? ` (${trade.session})` : ''} | ${fillText}${decayText}${atrScaleText}${evText}</div>`;
+    }
+
     function renderTradeCard(trade) {
         const cards = document.getElementById('cards');
         const cls = trade.direction === 'Long' ? 'long' : 'short';
@@ -2492,6 +2824,7 @@ Respond ONLY with valid JSON:
             <div class="row">AI context read (unvalidated): ${trade.confidence}</div>
             ${renderVolumeSection(trade)}
             ${renderConfluenceSection(trade)}
+            ${renderRegimeSection(trade)}
             <div class="row muted">${trade.notes}</div>
             <div class="row muted">Data freshness: ${trade.dataAgeMinutes}m old</div>
             ${renderNewsSection(trade.newsCheck)}
@@ -2902,11 +3235,18 @@ Respond ONLY with valid JSON:
             return { success: false, reason: `CoinGecko/Binance price mismatch (${priceCheck.diffPct.toFixed(1)}%)` };
         }
 
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, false, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, false, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null, config.signalDecayEnabled, config.signalDecayTau);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
+
+        // Regime classification (HTF) + ATR (LTF, used for fill probability and ATR sizing)
+        const regime = classifyRegime(candles.candlesHTF);
+        const atrSeriesLTF = calculateATRSeries(candles.candlesLTF.slice(-60), 14);
+        const atrNowLTF = calculateATR(candles.candlesLTF, 14);
+        const atrAvgLTF = atrSeriesLTF.length > 0 ? atrSeriesLTF.reduce((a, b) => a + b, 0) / atrSeriesLTF.length : null;
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
         const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
+        const fillProb = computeFillProbability(currentPrice, optimalEntry, atrNowLTF);
 
         const levels = computeAdaptiveTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config);
         if (!levels) {
@@ -2942,7 +3282,9 @@ Respond ONLY with valid JSON:
             newsCheck = { newsFound: false, riskLevel: 'unchecked', summary: `News check failed: ${e.message}`, conflictsWithDirection: false, sources: [] };
         }
 
-        const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
+        const sizing = config.atrSizingEnabled
+            ? computePositionSizeATR(levels.entry, levels.sl, config.accountBalance, config.riskPercent, atrNowLTF, atrAvgLTF)
+            : computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
 
         let spreadCheck = { available: false, reason: 'Bid/ask fetch skipped' };
         try {
@@ -2983,7 +3325,13 @@ Respond ONLY with valid JSON:
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
                 obLabel: filterResult.obResult ? filterResult.obResult.obLabel : null,
-                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
+                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null,
+                regime: regime.regime, atrRatio: regime.atrRatio !== undefined ? regime.atrRatio : null,
+                fillProbability: fillProb.label, fillProbAtrDistance: fillProb.atrDistance,
+                atrScale: sizing.atrScale !== undefined ? sizing.atrScale : 1,
+                confluenceScoreRaw: filterResult.confluenceScoreRaw !== undefined ? filterResult.confluenceScoreRaw : null,
+                decayFactor: filterResult.decayFactor !== undefined ? filterResult.decayFactor : 1,
+                session: sessionInfo.isLKZ ? 'London' : sessionInfo.isNYKZ ? 'NewYork' : sessionInfo.isAsian ? 'Asian' : 'Off-session'
             }
         };
     }
@@ -3008,11 +3356,17 @@ Respond ONLY with valid JSON:
         }
 
         const currentPrice = candles.closesLTF[candles.closesLTF.length - 1];
-        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, true, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null);
+        const filterResult = passesLocalFilter(candles.closesHTF, candles.candlesLTF, currentPrice, direction, config.confluenceWeights, config.minConfluenceScore, true, config.volumeDisplacementRatio, candles.closes4H || null, candles.candles4H || null, config.signalDecayEnabled, config.signalDecayTau);
         if (!filterResult.pass) return { success: false, reason: filterResult.reason };
+
+        const regime = classifyRegime(candles.candlesHTF);
+        const atrSeriesLTF = calculateATRSeries(candles.candlesLTF.slice(-60), 14);
+        const atrNowLTF = calculateATR(candles.candlesLTF, 14);
+        const atrAvgLTF = atrSeriesLTF.length > 0 ? atrSeriesLTF.reduce((a, b) => a + b, 0) / atrSeriesLTF.length : null;
 
         const optimalEntry = computeOptimalEntry(filterResult.swing.high, filterResult.swing.low, direction);
         const orderInfo = determineOrderType(currentPrice, optimalEntry, direction);
+        const fillProb = computeFillProbability(currentPrice, optimalEntry, atrNowLTF);
 
         const levels = computeAdaptiveTradeLevels(direction, orderInfo.entryPrice, filterResult.swing, config);
         if (!levels) {
@@ -3036,7 +3390,9 @@ Respond ONLY with valid JSON:
         if (validationError) return { success: false, reason: `Gemini response invalid: ${validationError}` };
         if (!analysis.valid) return { success: false, reason: `Gemini: ${analysis.notes || 'context did not support setup'}` };
 
-        const sizing = computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
+        const sizing = config.atrSizingEnabled
+            ? computePositionSizeATR(levels.entry, levels.sl, config.accountBalance, config.riskPercent, atrNowLTF, atrAvgLTF)
+            : computePositionSize(levels.entry, levels.sl, config.accountBalance, config.riskPercent);
 
         return {
             success: true,
@@ -3063,7 +3419,13 @@ Respond ONLY with valid JSON:
                 confluenceScore: filterResult.confluenceScore !== undefined ? filterResult.confluenceScore : null,
                 confluenceBreakdown: filterResult.confluenceBreakdown || null,
                 obLabel: filterResult.obResult ? filterResult.obResult.obLabel : null,
-                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null
+                tpMode: levels.tpMode, extensionRatioUsed: levels.extensionRatio || null,
+                regime: regime.regime, atrRatio: regime.atrRatio !== undefined ? regime.atrRatio : null,
+                fillProbability: fillProb.label, fillProbAtrDistance: fillProb.atrDistance,
+                atrScale: sizing.atrScale !== undefined ? sizing.atrScale : 1,
+                confluenceScoreRaw: filterResult.confluenceScoreRaw !== undefined ? filterResult.confluenceScoreRaw : null,
+                decayFactor: filterResult.decayFactor !== undefined ? filterResult.decayFactor : 1,
+                session: sessionInfo.isLKZ ? 'London' : sessionInfo.isNYKZ ? 'NewYork' : sessionInfo.isAsian ? 'Asian' : 'Off-session'
             }
         };
     }
@@ -3271,6 +3633,7 @@ Respond ONLY with valid JSON:
     onExitModeChange();
     renderJournal();
     renderCircuitBreakerStatus();
+    renderWinRateMatrix();
 
     (function restoreLiveTrades() {
         const restored = loadLiveTrades();
